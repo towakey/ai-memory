@@ -29,6 +29,7 @@
 - `GET /openapi.json` … GPTs 用 OpenAPI 3.1
 - `POST /mcp` … MCP Streamable HTTP（ツール: `kv_list` `kv_get` `kv_set` `kv_delete` `add_memory_log` `recall_memories` `get_recent_digests`）
 - `/admin` … ブラウザ管理画面（履歴・復元・削除済み表示つき）
+- OAuth 2.0（Authorization Code + PKCE + RFC7591登録）: `/oauth/authorize` `/oauth/token` `/oauth/register`。メタデータは `/.well-known/oauth-authorization-server` / `/.well-known/oauth-protected-resource`（ドメイン直下に `deploy/well-known/` の中身を `.well-known/` として配置）。Geminiアプリ等の標準OAuth必須クライアント向け。発行トークンは `oauth_tokens` で管理（無期限）
 
 ## 認証
 
