@@ -61,10 +61,17 @@ function db(): PDO {
         PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
         PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
     ]);
-    $pdo->exec('CREATE TABLE IF NOT EXISTS memories (key TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at TEXT NOT NULL)');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS memories (key TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at TEXT NOT NULL, category TEXT)');
+    // migrate.php 未適用の既存DB向けフォールバック（冪等）
+    $cols = array_column($pdo->query('PRAGMA table_info(memories)')->fetchAll(), 'name');
+    if (!in_array('category', $cols, true)) $pdo->exec('ALTER TABLE memories ADD COLUMN category TEXT');
     // shortcut: 履歴は無期限保持、DBが肥大化したら古い履歴の削除を追加
     $pdo->exec('CREATE TABLE IF NOT EXISTS memory_history (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT NOT NULL)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS memory_history_key ON memory_history(key, id)');
+    // 新記憶層（migrate.sql と同じ定義、冪等）
+    $pdo->exec("CREATE TABLE IF NOT EXISTS raw_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, source_ai TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')), processed_at TEXT)");
+    $pdo->exec('CREATE TABLE IF NOT EXISTS semantic_memories (id INTEGER PRIMARY KEY AUTOINCREMENT, summary TEXT NOT NULL, category TEXT, tags TEXT, importance INTEGER NOT NULL DEFAULT 3, embedding_json TEXT, updated_at TEXT)');
+    $pdo->exec("CREATE TABLE IF NOT EXISTS periodic_digests (id INTEGER PRIMARY KEY AUTOINCREMENT, period_type TEXT NOT NULL, period_label TEXT NOT NULL, digest_text TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))");
     return $pdo;
 }
 
@@ -87,19 +94,81 @@ function get_memory(string $key): ?array {
     return $row === false ? null : $row;
 }
 
-function save_memory(string $key, string $content): array {
+// $category 省略(null)時は既存の category を維持し、新規なら 'general'
+function save_memory(string $key, string $content, ?string $category = null): array {
     $now = date('c');
     $pdo = db();
     $pdo->beginTransaction();
-    // 変更前の行を履歴に退避（内容が同じなら退避しない）
+    // 変更前の行を履歴に退避（内容が同じなら退避しない。categoryのみの変更も退避される）
     $pdo->prepare('INSERT INTO memory_history (key, content, updated_at, archived_at)
         SELECT key, content, updated_at, ? FROM memories WHERE key = ? AND content <> ?')
         ->execute([$now, $key, $content]);
-    $pdo->prepare('INSERT INTO memories (key, content, updated_at) VALUES (?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at')
-        ->execute([$key, $content, $now]);
+    if ($category === null) {
+        $pdo->prepare('INSERT INTO memories (key, content, updated_at, category) VALUES (?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at')
+            ->execute([$key, $content, $now, 'general']);
+    } else {
+        $pdo->prepare('INSERT INTO memories (key, content, updated_at, category) VALUES (?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at, category = excluded.category')
+            ->execute([$key, $content, $now, $category]);
+    }
     $pdo->commit();
     return ['key' => $key, 'content' => $content, 'updated_at' => $now];
+}
+
+// 保存後に確定した category を取得する（kv_set の返り値用）
+function memory_category(string $key): ?string {
+    $st = db()->prepare('SELECT category FROM memories WHERE key = ?');
+    $st->execute([$key]);
+    $cat = $st->fetchColumn();
+    return $cat === false ? null : (is_string($cat) ? $cat : null);
+}
+
+function add_memory_log(string $content, ?string $source_ai): int {
+    if ($source_ai === null || trim($source_ai) === '') {
+        // shortcut: User-Agent の先頭トークンを AI 名代わりに使う。精度が必要になったらマッピング表に置き換え
+        $ua = trim((string)($_SERVER['HTTP_USER_AGENT'] ?? ''));
+        $first = $ua === '' ? '' : (preg_split('#[\s/;,()]+#', $ua)[0] ?? '');
+        $source_ai = $first === '' ? 'unknown' : $first;
+    }
+    $pdo = db();
+    $pdo->prepare('INSERT INTO raw_logs (content, source_ai) VALUES (?, ?)')
+        ->execute([$content, mb_substr(trim($source_ai), 0, 100)]);
+    return (int)$pdo->lastInsertId();
+}
+
+// Embedding 未実装のため summary/tags の LIKE キーワード検索のみ
+function recall_memories(string $query, int $limit = 5): array {
+    $limit = max(1, min(20, $limit));
+    $words = array_values(array_filter(
+        preg_split('/\s+/u', trim($query)) ?: [],
+        fn($w) => $w !== ''
+    ));
+    if ($words === []) return [];
+    $where = [];
+    $params = [];
+    foreach (array_slice($words, 0, 10) as $w) {
+        $where[] = "(summary LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')";
+        $p = '%' . addcslashes($w, '\\%_') . '%';
+        $params[] = $p;
+        $params[] = $p;
+    }
+    $st = db()->prepare('SELECT id, summary, category, tags, importance, updated_at FROM semantic_memories
+        WHERE ' . implode(' OR ', $where) . ' ORDER BY importance DESC, updated_at DESC LIMIT ' . $limit);
+    $st->execute($params);
+    return $st->fetchAll();
+}
+
+function get_recent_digests(?string $period_type, int $limit = 5): array {
+    $limit = max(1, min(100, $limit));
+    if ($period_type === null) {
+        return db()->query('SELECT id, period_type, period_label, digest_text, created_at FROM periodic_digests
+            ORDER BY created_at DESC LIMIT ' . $limit)->fetchAll();
+    }
+    $st = db()->prepare('SELECT id, period_type, period_label, digest_text, created_at FROM periodic_digests
+        WHERE period_type = ? ORDER BY created_at DESC LIMIT ' . $limit);
+    $st->execute([$period_type]);
+    return $st->fetchAll();
 }
 
 function delete_memory(string $key): bool {
@@ -150,63 +219,81 @@ function require_token(): void {
 function mcp_tools(): array {
     return [
         [
-            'name' => 'list_memories',
-            'description' => '保存されているメモのキーと更新日時の一覧を返します',
+            'name' => 'kv_list',
+            'description' => '会話開始時の把握用。確定記憶のキー一覧（key・category・updated_at）を返します。まずこれで全体を俯瞰し、必要なキーは kv_get で取得してください',
             'inputSchema' => ['type' => 'object', 'properties' => new stdClass],
         ],
         [
-            'name' => 'get_memory',
-            'description' => '指定したキーのメモ内容を取得します',
-            'inputSchema' => [
-                'type' => 'object',
-                'properties' => ['key' => ['type' => 'string', 'description' => 'メモのキー']],
-                'required' => ['key'],
-                'additionalProperties' => false,
-            ],
-        ],
-        [
-            'name' => 'put_memory',
-            'description' => 'メモを保存します。同じキーが既に存在する場合は上書き保存されます（上書き前の内容は履歴に自動保存されます）',
+            'name' => 'kv_get',
+            'description' => '確定記憶の値を取得します。key 指定で1件（key・value・category・updated_at）、category 指定でそのカテゴリの全件配列を返します。書き込みは kv_set、曖昧検索は recall_memories を使ってください',
             'inputSchema' => [
                 'type' => 'object',
                 'properties' => [
-                    'key' => ['type' => 'string', 'description' => 'メモのキー（英数字・._-、100文字以内）'],
-                    'content' => ['type' => 'string', 'description' => '保存する内容'],
+                    'key' => ['type' => 'string', 'description' => '取得するキー'],
+                    'category' => ['type' => 'string', 'description' => 'このカテゴリの全件を取得（key と併用不可・key 優先）'],
                 ],
-                'required' => ['key', 'content'],
                 'additionalProperties' => false,
             ],
         ],
         [
-            'name' => 'delete_memory',
-            'description' => '指定したキーのメモを削除します',
-            'inputSchema' => [
-                'type' => 'object',
-                'properties' => ['key' => ['type' => 'string', 'description' => 'メモのキー']],
-                'required' => ['key'],
-                'additionalProperties' => false,
-            ],
-        ],
-        [
-            'name' => 'get_history',
-            'description' => '指定したキーの過去の版の一覧（id付き）を返します。上書き・削除前の内容を確認できます',
-            'inputSchema' => [
-                'type' => 'object',
-                'properties' => ['key' => ['type' => 'string', 'description' => 'メモのキー']],
-                'required' => ['key'],
-                'additionalProperties' => false,
-            ],
-        ],
-        [
-            'name' => 'restore_memory',
-            'description' => '指定した履歴idの内容でメモを復元します。現在の内容は履歴に自動保存されます',
+            'name' => 'kv_set',
+            'description' => '確定した事実・設定・プロジェクト状態など長期保持する情報を保存します。同じキーは上書き（旧内容は履歴に自動保存されRESTで復元可能）。その場限りのメモや好みは add_memory_log を使ってください',
             'inputSchema' => [
                 'type' => 'object',
                 'properties' => [
-                    'key' => ['type' => 'string', 'description' => 'メモのキー'],
-                    'id' => ['type' => 'integer', 'description' => 'get_history で取得した履歴のid'],
+                    'key' => ['type' => 'string', 'description' => 'キー（英数字・._-、100文字以内）'],
+                    'value' => ['type' => 'string', 'description' => '保存する内容'],
+                    'category' => ['type' => 'string', 'description' => '分類カテゴリ（100文字以内。省略時は既存維持・新規は general）'],
                 ],
-                'required' => ['key', 'id'],
+                'required' => ['key', 'value'],
+                'additionalProperties' => false,
+            ],
+        ],
+        [
+            'name' => 'kv_delete',
+            'description' => '確定記憶を削除します。削除前の内容は履歴に自動保存され、REST 経由で復元可能です',
+            'inputSchema' => [
+                'type' => 'object',
+                'properties' => ['key' => ['type' => 'string', 'description' => '削除するキー']],
+                'required' => ['key'],
+                'additionalProperties' => false,
+            ],
+        ],
+        [
+            'name' => 'add_memory_log',
+            'description' => 'ちょっとした出来事・好み・文脈メモを即記録。後でバッチが長期記憶に整理します。確定済みの事実や設定は kv_set に保存してください',
+            'inputSchema' => [
+                'type' => 'object',
+                'properties' => [
+                    'content' => ['type' => 'string', 'description' => '記録するメモ内容'],
+                    'source_ai' => ['type' => 'string', 'description' => '記録したAI名（省略時は User-Agent から推定）'],
+                ],
+                'required' => ['content'],
+                'additionalProperties' => false,
+            ],
+        ],
+        [
+            'name' => 'recall_memories',
+            'description' => 'エピソード・好みなど曖昧な記憶を検索します。現在はキーワード検索（ベクトル検索は未実装）。query を空白区切りの各語で OR 検索し importance 順で返します。確定記憶は kv_list / kv_get を使ってください',
+            'inputSchema' => [
+                'type' => 'object',
+                'properties' => [
+                    'query' => ['type' => 'string', 'description' => '検索語（空白区切りでOR検索）'],
+                    'limit' => ['type' => 'integer', 'description' => '最大件数（デフォルト5・上限20）'],
+                ],
+                'required' => ['query'],
+                'additionalProperties' => false,
+            ],
+        ],
+        [
+            'name' => 'get_recent_digests',
+            'description' => '直近の日次/週次要約を返します。近況の俯瞰・前回までの流れの把握に',
+            'inputSchema' => [
+                'type' => 'object',
+                'properties' => [
+                    'period_type' => ['type' => 'string', 'description' => '絞り込み（daily / weekly など）'],
+                    'limit' => ['type' => 'integer', 'description' => '最大件数（デフォルト5）'],
+                ],
                 'additionalProperties' => false,
             ],
         ],
@@ -223,34 +310,56 @@ function mcp_text(string $text, bool $isError = false): array {
 function mcp_call_tool(string $name, array $args): ?array {
     $enc = function ($v) { return json_encode($v, JSON_UNESCAPED_UNICODE); };
     switch ($name) {
-        case 'list_memories':
-            return mcp_text($enc(list_memories()));
-        case 'get_memory':
+        case 'kv_list':
+            return mcp_text($enc(db()->query('SELECT key, category, updated_at FROM memories ORDER BY key')->fetchAll()));
+        case 'kv_get':
+            $key = $args['key'] ?? null;
+            $cat = $args['category'] ?? null;
+            if (is_string($key) && $key !== '') {
+                if (!valid_key($key)) return mcp_text('invalid key', true);
+                $st = db()->prepare('SELECT key, content AS value, category, updated_at FROM memories WHERE key = ?');
+                $st->execute([$key]);
+                $row = $st->fetch();
+                return $row === false ? mcp_text('not found', true) : mcp_text($enc($row));
+            }
+            if (is_string($cat) && $cat !== '') {
+                $st = db()->prepare('SELECT key, content AS value, category, updated_at FROM memories WHERE category = ? ORDER BY key');
+                $st->execute([$cat]);
+                return mcp_text($enc($st->fetchAll()));
+            }
+            return mcp_text('key または category のどちらかを指定してください', true);
+        case 'kv_set':
             $key = $args['key'] ?? '';
+            $value = $args['value'] ?? null;
+            $cat = $args['category'] ?? null;
             if (!valid_key($key)) return mcp_text('invalid key', true);
-            $m = get_memory($key);
-            return $m === null ? mcp_text('not found', true) : mcp_text($enc($m));
-        case 'put_memory':
-            $key = $args['key'] ?? '';
-            $content = $args['content'] ?? null;
-            if (!valid_key($key)) return mcp_text('invalid key', true);
-            if (!valid_content($content)) return mcp_text('invalid content', true);
-            return mcp_text($enc(save_memory($key, $content)));
-        case 'delete_memory':
+            if (!valid_content($value)) return mcp_text('invalid value', true);
+            if ($cat !== null && (!is_string($cat) || strlen($cat) > 100)) return mcp_text('invalid category', true);
+            if ($cat === '') $cat = null;
+            $saved = save_memory($key, $value, $cat);
+            return mcp_text($enc(['key' => $saved['key'], 'value' => $saved['content'],
+                'category' => $cat ?? memory_category($key), 'updated_at' => $saved['updated_at']]));
+        case 'kv_delete':
             $key = $args['key'] ?? '';
             if (!valid_key($key)) return mcp_text('invalid key', true);
             return delete_memory($key) ? mcp_text('{"deleted":true}') : mcp_text('not found', true);
-        case 'get_history':
-            $key = $args['key'] ?? '';
-            if (!valid_key($key)) return mcp_text('invalid key', true);
-            return mcp_text($enc(get_history($key)));
-        case 'restore_memory':
-            $key = $args['key'] ?? '';
-            $id = $args['id'] ?? null;
-            if (!valid_key($key)) return mcp_text('invalid key', true);
-            if (!is_int($id)) return mcp_text('invalid id', true);
-            $m = restore_memory($key, $id);
-            return $m === null ? mcp_text('not found', true) : mcp_text($enc($m));
+        case 'add_memory_log':
+            $content = $args['content'] ?? null;
+            if (!valid_content($content)) return mcp_text('invalid content', true);
+            $src = $args['source_ai'] ?? null;
+            if ($src !== null && !is_string($src)) return mcp_text('invalid source_ai', true);
+            return mcp_text($enc(['id' => add_memory_log($content, $src)]));
+        case 'recall_memories':
+            $q = $args['query'] ?? null;
+            if (!is_string($q) || trim($q) === '') return mcp_text('invalid query', true);
+            $limit = $args['limit'] ?? 5;
+            if (!is_int($limit)) $limit = is_numeric($limit) ? (int)$limit : 5;
+            return mcp_text($enc(recall_memories($q, $limit)));
+        case 'get_recent_digests':
+            $pt = $args['period_type'] ?? null;
+            $limit = $args['limit'] ?? 5;
+            if (!is_int($limit)) $limit = is_numeric($limit) ? (int)$limit : 5;
+            return mcp_text($enc(get_recent_digests(is_string($pt) && $pt !== '' ? $pt : null, $limit)));
         default:
             return null;
     }
@@ -286,7 +395,7 @@ function handle_mcp(): void {
                 'protocolVersion' => in_array($requested, $supported, true) ? $requested : '2025-06-18',
                 'capabilities' => ['tools' => new stdClass],
                 'serverInfo' => ['name' => 'ai-memory', 'version' => '1.0.0'],
-                'instructions' => 'ユーザーの個人情報と作業状況の共有メモ。会話開始時に list_memories→必要なら get_memory。進捗があれば put_memory で更新。誤って上書き・削除したら get_history → restore_memory で戻せる',
+                'instructions' => '複数のAIで共有する個人メモリ。確定事実はkv_*、その場限りのメモや好み・エピソードはadd_memory_log、曖昧検索はrecall_memories、近況俯瞰はget_recent_digests。上書き・削除は履歴に自動保存され、REST経由で復元可能',
             ]);
             break;
         case 'ping':

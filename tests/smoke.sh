@@ -104,20 +104,46 @@ body_of "$resp" | grep -q '"name":"ai-memory"' && check "mcp serverInfo" ok ok |
 
 resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
 check "mcp tools/list" 200 "$(status_of "$resp")"
-body_of "$resp" | grep -q '"name":"list_memories"' && body_of "$resp" | grep -q '"name":"put_memory"' && check "mcp tools" ok ok || check "mcp tools" ok missing
+body_of "$resp" | grep -q '"name":"kv_set"' && body_of "$resp" | grep -q '"name":"add_memory_log"' && body_of "$resp" | grep -q '"name":"recall_memories"' && check "mcp tools" ok ok || check "mcp tools" ok missing
 
-resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"put_memory","arguments":{"key":"smoke_mcp","content":"via mcp"}}}')
-check "mcp put" 200 "$(status_of "$resp")"
-body_of "$resp" | grep -q 'smoke_mcp' && check "mcp put body" ok ok || check "mcp put body" ok missing
+# kv_set (category付き) -> kv_get
+resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kv_set","arguments":{"key":"smoke_mcp","value":"via mcp","category":"smoke"}}}')
+check "mcp kv_set" 200 "$(status_of "$resp")"
+body_of "$resp" | grep -q 'smoke_mcp' && body_of "$resp" | grep -qF 'value\":\"via mcp' && body_of "$resp" | grep -qF 'category\":\"smoke' && check "mcp kv_set body" ok ok || check "mcp kv_set body" ok "$(body_of "$resp")"
 
-resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_memory","arguments":{"key":"smoke_mcp"}}}')
-body_of "$resp" | grep -q 'via mcp' && check "mcp get" ok ok || check "mcp get" ok "$(body_of "$resp")"
+resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"kv_get","arguments":{"key":"smoke_mcp"}}}')
+body_of "$resp" | grep -q 'via mcp' && body_of "$resp" | grep -qF 'category\":\"smoke' && check "mcp kv_get" ok ok || check "mcp kv_get" ok "$(body_of "$resp")"
 
-resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"delete_memory","arguments":{"key":"smoke_mcp"}}}')
-body_of "$resp" | grep -q 'deleted' && check "mcp delete" ok ok || check "mcp delete" ok missing
+# kv_get category 指定 -> 該当カテゴリの配列
+resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"kv_get","arguments":{"category":"smoke"}}}')
+body_of "$resp" | grep -q 'smoke_mcp' && check "mcp kv_get by category" ok ok || check "mcp kv_get by category" ok "$(body_of "$resp")"
 
-resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"get_memory","arguments":{"key":"smoke_mcp"}}}')
+# kv_list
+resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"kv_list","arguments":{}}}')
+body_of "$resp" | grep -q 'smoke_mcp' && check "mcp kv_list" ok ok || check "mcp kv_list" ok "$(body_of "$resp")"
+
+# category省略の上書きは既存category維持
+req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"kv_set","arguments":{"key":"smoke_mcp","value":"via mcp 2"}}}' >/dev/null
+resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"kv_get","arguments":{"key":"smoke_mcp"}}}')
+body_of "$resp" | grep -qF 'category\":\"smoke' && check "kv_set keeps category" ok ok || check "kv_set keeps category" ok "$(body_of "$resp")"
+
+# kv_delete
+resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"kv_delete","arguments":{"key":"smoke_mcp"}}}')
+body_of "$resp" | grep -q 'deleted' && check "mcp kv_delete" ok ok || check "mcp kv_delete" ok missing
+
+resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"kv_get","arguments":{"key":"smoke_mcp"}}}')
 body_of "$resp" | grep -q '"isError":true' && check "mcp not found isError" ok ok || check "mcp not found isError" ok missing
+
+# add_memory_log
+resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"add_memory_log","arguments":{"content":"smoke log entry","source_ai":"smoke-test"}}}')
+body_of "$resp" | grep -q '"id":' && check "mcp add_memory_log" ok ok || check "mcp add_memory_log" ok "$(body_of "$resp")"
+
+# recall_memories / get_recent_digests は配列で返ること（空でもOK）
+resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":62,"method":"tools/call","params":{"name":"recall_memories","arguments":{"query":"smoke"}}}')
+body_of "$resp" | grep -q '"text":"\[' && check "mcp recall_memories" ok ok || check "mcp recall_memories" ok "$(body_of "$resp")"
+
+resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"get_recent_digests","arguments":{}}}')
+body_of "$resp" | grep -q '"text":"\[' && check "mcp get_recent_digests" ok ok || check "mcp get_recent_digests" ok "$(body_of "$resp")"
 
 resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","method":"notifications/initialized"}')
 check "mcp notification -> 202" 202 "$(status_of "$resp")"
@@ -126,12 +152,6 @@ resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d
 body_of "$resp" | grep -q '"code":-32601' && check "mcp unknown -32601" ok ok || check "mcp unknown -32601" ok missing
 
 check "mcp GET -> 405" 405 "$(code -H "$AUTH" "$BASE/mcp")"
-
-resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"get_history","arguments":{"key":"smoke_hist"}}}')
-body_of "$resp" | grep -q 'v1' && check "mcp get_history" ok ok || check "mcp get_history" ok "$(body_of "$resp")"
-
-resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"restore_memory\",\"arguments\":{\"key\":\"smoke_hist\",\"id\":$hid}}}")
-body_of "$resp" | grep -q 'v1' && check "mcp restore_memory" ok ok || check "mcp restore_memory" ok "$(body_of "$resp")"
 
 # --- 403 (直アクセス拒否) ---
 check "config.php -> 403" 403 "$(code "$BASE/config.php")"
@@ -173,7 +193,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 DBF="$DIR/../data/memory.sqlite"
 PHP_BIN="${PHP_BIN:-php}"
 if [ -f "$DBF" ] && command -v "$PHP_BIN" >/dev/null 2>&1; then
-  "$PHP_BIN" -r '$pdo=new PDO("sqlite:".$argv[1]);$pdo->prepare("DELETE FROM memory_history WHERE key LIKE ?")->execute(["smoke%"]);' "$DBF" \
+  "$PHP_BIN" -r '$pdo=new PDO("sqlite:".$argv[1]);$pdo->prepare("DELETE FROM memory_history WHERE key LIKE ?")->execute(["smoke%"]);$pdo->exec("DELETE FROM raw_logs WHERE content LIKE '"'"'smoke%'"'"'");' "$DBF" \
     && echo "history cleanup done"
 elif [ -f "$DBF" ]; then
   echo "WARN: php CLI 不在のため履歴クリーンアップ未実行（PHP_BIN で指定可）"
