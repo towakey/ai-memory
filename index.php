@@ -72,6 +72,10 @@ function db(): PDO {
     $pdo->exec("CREATE TABLE IF NOT EXISTS raw_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, source_ai TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')), processed_at TEXT)");
     $pdo->exec('CREATE TABLE IF NOT EXISTS semantic_memories (id INTEGER PRIMARY KEY AUTOINCREMENT, summary TEXT NOT NULL, category TEXT, tags TEXT, importance INTEGER NOT NULL DEFAULT 3, embedding_json TEXT, updated_at TEXT)');
     $pdo->exec("CREATE TABLE IF NOT EXISTS periodic_digests (id INTEGER PRIMARY KEY AUTOINCREMENT, period_type TEXT NOT NULL, period_label TEXT NOT NULL, digest_text TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))");
+    // OAuth 2.0 (Authorization Code + PKCE) 用テーブル
+    $pdo->exec('CREATE TABLE IF NOT EXISTS oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL, created_at TEXT NOT NULL)');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS oauth_codes (code TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL, code_challenge TEXT, expires_at TEXT NOT NULL)');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS oauth_tokens (token TEXT PRIMARY KEY, client_id TEXT, created_at TEXT NOT NULL)');
     return $pdo;
 }
 
@@ -210,9 +214,15 @@ function request_token(): ?string {
 function require_token(): void {
     global $API_KEY;
     $token = request_token();
-    if ($token === null || !hash_equals($API_KEY, $token)) {
-        json_out(['error' => 'unauthorized'], 401);
+    if ($token !== null) {
+        if (hash_equals($API_KEY, $token)) return;
+        // OAuth で発行したアクセストークンも有効
+        $st = db()->prepare('SELECT 1 FROM oauth_tokens WHERE token = ?');
+        $st->execute([$token]);
+        if ($st->fetchColumn() !== false) return;
     }
+    header('WWW-Authenticate: Bearer resource_metadata="' . origin() . '/.well-known/oauth-protected-resource"');
+    json_out(['error' => 'unauthorized'], 401);
 }
 
 // ---------- MCP ----------
@@ -695,9 +705,204 @@ pre{white-space:pre-wrap;word-break:break-word;background:#080808;border:1px sol
     exit;
 }
 
+// ---------- OAuth 2.0 (Authorization Code + PKCE) ----------
+function origin(): string {
+    return (is_https() ? 'https' : 'http') . '://' . ($_SERVER['HTTP_HOST'] ?? 'localhost');
+}
+
+// 同意画面・エラー画面の共通HTML（adminと同系の暗いテーマ・最小CSS）
+function oauth_page(string $title, string $body): void {
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>' . h($title) . ' | AI MEMORY</title><style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;color:#c9c9c9;font:15px/1.6 ui-monospace,Consolas,"Courier New",monospace;
+background:radial-gradient(circle at 50% -10%,rgba(255,122,0,.07),transparent 55%),#0a0a0a}
+.panel{width:min(440px,100%);background:#0f0f0f;border:1px solid #262626;padding-bottom:26px}
+.stripe{height:7px;background:repeating-linear-gradient(45deg,#ff7a00 0 14px,#0a0a0a 14px 28px);margin-bottom:22px}
+h1{margin:0;color:#ff7a00;font-size:22px;letter-spacing:.1em;text-align:center}
+.sub{margin:2px 0 18px;color:#8a8a8a;font-size:10px;letter-spacing:.3em;text-align:center}
+.inner{display:grid;gap:14px;padding:0 28px}
+.kv{font-size:11px;letter-spacing:.22em;color:#8a8a8a}.kv div{color:#39ff6a;font-size:14px;letter-spacing:0;word-break:break-all;margin-top:2px}
+label{display:grid;gap:6px;font-size:11px;letter-spacing:.22em;color:#8a8a8a}
+input{background:#070707;border:1px solid #2c2c2c;color:#e8e8e8;font:16px/1.5 ui-monospace,Consolas,monospace;padding:10px}
+input:focus{outline:2px solid #ff7a00}
+button{cursor:pointer;background:#ff7a00;border:2px solid #ff7a00;color:#000;font:inherit;font-weight:bold;letter-spacing:.18em;min-height:44px}
+.flash{border:1px solid #e0301e;background:rgba(224,48,30,.14);color:#ff9a90;padding:10px 14px;font-size:13px}
+</style></head><body><main class="panel"><div class="stripe"></div><h1>AI MEMORY</h1><p class="sub">' . h($title) . '</p>' . $body . '</main></body></html>';
+    exit;
+}
+
+// パラメータ不正時はエラー画面を返す（redirect_uri へのリダイレクトは行わない）
+function oauth_error(string $msg, int $code = 400): void {
+    http_response_code($code);
+    oauth_page('ERROR', '<div class="inner"><div class="flash">' . h($msg) . '</div></div>');
+}
+
+// 登録済みクライアントは登録 redirect_uris に完全一致、未登録は許可ホストのみ
+function oauth_redirect_allowed(string $client_id, string $redirect_uri): bool {
+    $st = db()->prepare('SELECT redirect_uris FROM oauth_clients WHERE client_id = ?');
+    $st->execute([$client_id]);
+    $row = $st->fetch();
+    if ($row !== false) {
+        $uris = json_decode((string)$row['redirect_uris'], true);
+        return is_array($uris) && in_array($redirect_uri, $uris, true);
+    }
+    $host = parse_url($redirect_uri, PHP_URL_HOST);
+    return is_string($host) && in_array(strtolower($host), ['gemini.google.com', 'accounts.google.com', 'localhost', '127.0.0.1'], true);
+}
+
+function handle_oauth_authorize(): void {
+    global $API_KEY;
+    $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+    if ($method !== 'GET' && $method !== 'POST') {
+        header('Allow: GET, POST');
+        json_out(['error' => 'method not allowed'], 405);
+    }
+    $p = $method === 'POST' ? $_POST : $_GET;
+    $get = static function (string $k) use ($p): ?string {
+        $v = $p[$k] ?? null;
+        return is_string($v) && $v !== '' ? $v : null;
+    };
+    $client_id = $get('client_id');
+    $redirect_uri = $get('redirect_uri');
+    $state = $get('state');
+    $challenge = $get('code_challenge');
+    $ccm = $get('code_challenge_method');
+
+    if ($get('response_type') !== 'code') oauth_error('response_type must be "code"');
+    if ($client_id === null || $redirect_uri === null) oauth_error('client_id and redirect_uri are required');
+    // PKCE は S256 のみ。method 省略は RFC7636 上 plain 扱いのため challenge がある場合も必須
+    if ($ccm !== 'S256' && ($ccm !== null || $challenge !== null)) oauth_error('code_challenge_method must be S256');
+    if (!oauth_redirect_allowed($client_id, $redirect_uri)) oauth_error('redirect_uri is not allowed');
+
+    $hidden = '';
+    foreach (['response_type' => 'code', 'client_id' => $client_id, 'redirect_uri' => $redirect_uri,
+              'state' => $state, 'code_challenge' => $challenge, 'code_challenge_method' => $ccm] as $k => $v) {
+        if ($v !== null) $hidden .= '<input type="hidden" name="' . h($k) . '" value="' . h($v) . '">';
+    }
+    $host = parse_url($redirect_uri, PHP_URL_HOST);
+    $info = '<div class="inner"><div class="kv">CLIENT<div>' . h($client_id) . '</div></div>'
+        . '<div class="kv">REDIRECT HOST<div>' . h(is_string($host) ? $host : $redirect_uri) . '</div></div></div>';
+    $form = static function (?string $err) use ($hidden, $info): string {
+        return $info . ($err === null ? '' : '<div class="inner"><div class="flash">' . h($err) . '</div></div>')
+            . '<form method="post" class="inner">' . $hidden
+            . '<label>API KEY<input type="password" name="api_key" required autocomplete="current-password"></label>'
+            . '<button type="submit">AUTHORIZE</button></form>';
+    };
+
+    if ($method === 'GET') oauth_page('AUTHORIZE', $form(null));
+
+    // CSRF は不要（APIキー入力が実質の認証）
+    $key = $p['api_key'] ?? null;
+    if (!is_string($key) || !hash_equals($API_KEY, $key)) oauth_page('AUTHORIZE', $form('APIキーが違います'));
+
+    $code = bin2hex(random_bytes(32));
+    db()->prepare('INSERT INTO oauth_codes (code, client_id, redirect_uri, code_challenge, expires_at) VALUES (?, ?, ?, ?, ?)')
+        ->execute([$code, $client_id, $redirect_uri, $challenge, date('c', time() + 600)]);
+    $sep = strpos($redirect_uri, '?') === false ? '?' : '&';
+    $loc = $redirect_uri . $sep . 'code=' . rawurlencode($code);
+    if ($state !== null) $loc .= '&state=' . rawurlencode($state);
+    header('Location: ' . $loc, true, 302);
+    exit;
+}
+
+function handle_oauth_token(): void {
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+        header('Allow: POST');
+        json_out(['error' => 'method not allowed'], 405);
+    }
+    $p = $_POST;
+    if ($p === []) {
+        $j = json_decode((string)file_get_contents('php://input'), true);
+        if (is_array($j)) $p = $j;
+    }
+    if (($p['grant_type'] ?? null) !== 'authorization_code') {
+        json_out(['error' => 'unsupported_grant_type'], 400);
+    }
+    $code = $p['code'] ?? null;
+    if (!is_string($code) || $code === '') json_out(['error' => 'invalid_grant'], 400);
+    $st = db()->prepare('SELECT client_id, redirect_uri, code_challenge, expires_at FROM oauth_codes WHERE code = ?');
+    $st->execute([$code]);
+    $row = $st->fetch();
+    // expires_at は date('c') 同士の文字列比較（同一タイムゾーン前提）
+    $ok = $row !== false
+        && $row['expires_at'] > date('c')
+        && $row['client_id'] === ($p['client_id'] ?? null)
+        && $row['redirect_uri'] === ($p['redirect_uri'] ?? null);
+    if ($ok && $row['code_challenge'] !== null && $row['code_challenge'] !== '') {
+        $verifier = $p['code_verifier'] ?? null;
+        $ok = is_string($verifier) && hash_equals((string)$row['code_challenge'],
+            rtrim(strtr(base64_encode(hash('sha256', $verifier, true)), '+/', '-_'), '='));
+    }
+    if (!$ok) json_out(['error' => 'invalid_grant'], 400);
+    // 認証コードは使い回し禁止（検証成功後に削除）
+    db()->prepare('DELETE FROM oauth_codes WHERE code = ?')->execute([$code]);
+    $token = bin2hex(random_bytes(32));
+    db()->prepare('INSERT INTO oauth_tokens (token, client_id, created_at) VALUES (?, ?, ?)')
+        ->execute([$token, $row['client_id'], date('c')]);
+    // expires_in/refresh_token は省略（無期限扱い）
+    json_out(['access_token' => $token, 'token_type' => 'Bearer']);
+}
+
+// RFC7591 最小実装の動的クライアント登録
+function handle_oauth_register(): void {
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+        header('Allow: POST');
+        json_out(['error' => 'method not allowed'], 405);
+    }
+    $body = json_decode((string)file_get_contents('php://input'), true);
+    $uris = is_array($body) ? ($body['redirect_uris'] ?? null) : null;
+    if (!is_array($uris) || $uris === [] || array_filter($uris, fn($u) => !is_string($u) || $u === '') !== []) {
+        json_out(['error' => 'invalid_client_metadata'], 400);
+    }
+    $name = isset($body['client_name']) && is_string($body['client_name']) ? $body['client_name'] : null;
+    $client_id = bin2hex(random_bytes(16));
+    db()->prepare('INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at) VALUES (?, ?, ?, ?)')
+        ->execute([$client_id, $name, json_encode(array_values($uris)), date('c')]);
+    json_out([
+        'client_id' => $client_id,
+        'client_name' => $name,
+        'redirect_uris' => array_values($uris),
+        'token_endpoint_auth_method' => 'none',
+        'grant_types' => ['authorization_code'],
+        'response_types' => ['code'],
+    ], 201);
+}
+
+// アプリ配下パスの .well-known（ドメイン直下は別ファイルで配信）
+function handle_oauth_metadata(string $base, string $which): void {
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
+        header('Allow: GET');
+        json_out(['error' => 'method not allowed'], 405);
+    }
+    $origin = origin();
+    if ($which === 'authorization-server') {
+        json_out([
+            'issuer' => $origin,
+            'authorization_endpoint' => $origin . $base . '/oauth/authorize',
+            'token_endpoint' => $origin . $base . '/oauth/token',
+            'registration_endpoint' => $origin . $base . '/oauth/register',
+            'response_types_supported' => ['code'],
+            'grant_types_supported' => ['authorization_code'],
+            'code_challenge_methods_supported' => ['S256'],
+            'token_endpoint_auth_methods_supported' => ['none'],
+        ]);
+    }
+    json_out([
+        'resource' => $origin . $base . '/mcp',
+        'authorization_servers' => [$origin],
+        'bearer_methods_supported' => ['header'],
+    ]);
+}
+
 // ---------- ルーティング ----------
 if ($path === '/openapi.json') send_openapi($BASE);
 if ($path === '/admin') handle_admin($BASE);
+// OAuth 2.0 エンドポイント（認証不要）
+if ($path === '/oauth/authorize') handle_oauth_authorize();
+if ($path === '/oauth/token') handle_oauth_token();
+if ($path === '/oauth/register') handle_oauth_register();
+if ($path === '/.well-known/oauth-authorization-server') handle_oauth_metadata($BASE, 'authorization-server');
+if ($path === '/.well-known/oauth-protected-resource') handle_oauth_metadata($BASE, 'protected-resource');
 
 require_token();
 

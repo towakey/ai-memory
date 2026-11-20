@@ -183,6 +183,67 @@ resp=$(req -H "$AUTH" "$BASE/api/memories/smoke_admin")
 body_of "$resp" | grep -q '"content":"admintest"' && check "admin restored data" ok ok || check "admin restored data" ok "$(body_of "$resp")"
 rm -f "$jar"
 
+# --- OAuth 2.0 (Authorization Code + PKCE) ---
+PHP_BIN="${PHP_BIN:-php}"
+CID=""
+resp=$(req -X POST -H 'Content-Type: application/json' "$BASE/oauth/register" -d '{"redirect_uris":["http://localhost:9999/cb"],"client_name":"smoke-oauth"}')
+check "oauth register -> 201" 201 "$(status_of "$resp")"
+CID=$(body_of "$resp" | grep -o '"client_id":"[a-f0-9]*"' | head -1 | cut -d'"' -f4)
+check "client_id issued" 32 "${#CID}"
+
+VERIFIER="smoke-verifier-$(date +%s)-$$"
+CHAL=$("$PHP_BIN" -r 'echo rtrim(strtr(base64_encode(hash("sha256",$argv[1],true)),"+/","-_"),"=");' "$VERIFIER" 2>/dev/null)
+check "pkce challenge generated" 43 "${#CHAL}"
+
+RURI='http://localhost:9999/cb'
+RURI_ENC='http%3A%2F%2Flocalhost%3A9999%2Fcb'
+resp=$(req "$BASE/oauth/authorize?response_type=code&client_id=$CID&redirect_uri=$RURI_ENC&state=xyz&code_challenge=$CHAL&code_challenge_method=S256")
+check "authorize GET -> 200" 200 "$(status_of "$resp")"
+body_of "$resp" | grep -q 'name="api_key"' && check "authorize form" ok ok || check "authorize form" ok missing
+
+out=$(curl -s -o /dev/null -w $'%{http_code}\n%{redirect_url}' -X POST "$BASE/oauth/authorize" \
+  --data-urlencode "response_type=code" --data-urlencode "client_id=$CID" \
+  --data-urlencode "redirect_uri=$RURI" --data-urlencode "state=xyz" \
+  --data-urlencode "code_challenge=$CHAL" --data-urlencode "code_challenge_method=S256" \
+  --data-urlencode "api_key=$TOKEN")
+check "authorize POST -> 302" 302 "$(printf '%s\n' "$out" | head -n1)"
+LOC=$(printf '%s\n' "$out" | tail -n1)
+case "$LOC" in *state=xyz*) check "redirect has state" ok ok ;; *) check "redirect has state" ok "$LOC" ;; esac
+CODE=$(printf '%s' "$LOC" | grep -o 'code=[a-f0-9]*' | head -1 | cut -d= -f2)
+check "redirect has code" 64 "${#CODE}"
+
+resp=$(req -X POST "$BASE/oauth/token" --data-urlencode "grant_type=authorization_code" \
+  --data-urlencode "code=$CODE" --data-urlencode "redirect_uri=$RURI" --data-urlencode "client_id=$CID")
+check "token without verifier -> 400" 400 "$(status_of "$resp")"
+body_of "$resp" | grep -q 'invalid_grant' && check "invalid_grant body" ok ok || check "invalid_grant body" ok "$(body_of "$resp")"
+
+resp=$(req -X POST "$BASE/oauth/token" --data-urlencode "grant_type=authorization_code" \
+  --data-urlencode "code=$CODE" --data-urlencode "redirect_uri=$RURI" --data-urlencode "client_id=$CID" \
+  --data-urlencode "code_verifier=$VERIFIER")
+check "token with verifier -> 200" 200 "$(status_of "$resp")"
+OATOKEN=$(body_of "$resp" | grep -o '"access_token":"[a-f0-9]*"' | head -1 | cut -d'"' -f4)
+check "access_token issued" 64 "${#OATOKEN}"
+
+check "oauth token /api/memories" 200 "$(code -H "Authorization: Bearer $OATOKEN" "$BASE/api/memories")"
+resp=$(req -X POST -H "Authorization: Bearer $OATOKEN" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":9,"method":"tools/list"}')
+check "oauth token /mcp tools/list" 200 "$(status_of "$resp")"
+
+resp=$(req -X POST "$BASE/oauth/token" --data-urlencode "grant_type=authorization_code" \
+  --data-urlencode "code=$CODE" --data-urlencode "redirect_uri=$RURI" --data-urlencode "client_id=$CID" \
+  --data-urlencode "code_verifier=$VERIFIER")
+check "code reuse -> 400" 400 "$(status_of "$resp")"
+
+check "bad host authorize -> 400" 400 "$(code "$BASE/oauth/authorize?response_type=code&client_id=nosuchclient&redirect_uri=https%3A%2F%2Fevil.example.com%2Fcb")"
+check "localhost authorize -> 200" 200 "$(code "$BASE/oauth/authorize?response_type=code&client_id=nosuchclient&redirect_uri=http%3A%2F%2Flocalhost%3A8888%2Fcb")"
+
+resp=$(req "$BASE/.well-known/oauth-authorization-server")
+check "well-known as -> 200" 200 "$(status_of "$resp")"
+body_of "$resp" | grep -q '"authorization_endpoint"' && body_of "$resp" | grep -q '"code_challenge_methods_supported":\["S256"\]' && check "well-known json" ok ok || check "well-known json" ok "$(body_of "$resp")"
+check "well-known pr -> 200" 200 "$(code "$BASE/.well-known/oauth-protected-resource")"
+
+hdr=$(curl -s -D - -o /dev/null "$BASE/api/memories")
+printf '%s' "$hdr" | tr -d '\r' | grep -qi '^www-authenticate:.*oauth-protected-resource' && check "401 WWW-Authenticate" ok ok || check "401 WWW-Authenticate" ok missing
+
 # --- クリーンアップ ---
 curl -s -X DELETE -H "$AUTH" "$BASE/api/memories/smoke_admin" >/dev/null
 curl -s -X DELETE -H "$AUTH" "$BASE/api/memories/smoke_hist" >/dev/null
@@ -193,7 +254,13 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 DBF="$DIR/../data/memory.sqlite"
 PHP_BIN="${PHP_BIN:-php}"
 if [ -f "$DBF" ] && command -v "$PHP_BIN" >/dev/null 2>&1; then
-  "$PHP_BIN" -r '$pdo=new PDO("sqlite:".$argv[1]);$pdo->prepare("DELETE FROM memory_history WHERE key LIKE ?")->execute(["smoke%"]);$pdo->exec("DELETE FROM raw_logs WHERE content LIKE '"'"'smoke%'"'"'");' "$DBF" \
+  "$PHP_BIN" -r '$pdo=new PDO("sqlite:".$argv[1]);$pdo->prepare("DELETE FROM memory_history WHERE key LIKE ?")->execute(["smoke%"]);$pdo->exec("DELETE FROM raw_logs WHERE content LIKE '"'"'smoke%'"'"'");
+    $tables=array_column($pdo->query("SELECT name FROM sqlite_master")->fetchAll(),"name");
+    if(in_array("oauth_clients",$tables,true)){
+      $pdo->prepare("DELETE FROM oauth_clients WHERE client_id=?")->execute([$argv[2]]);
+      $pdo->prepare("DELETE FROM oauth_codes WHERE client_id=?")->execute([$argv[2]]);
+      $pdo->prepare("DELETE FROM oauth_tokens WHERE client_id=?")->execute([$argv[2]]);
+    }' "$DBF" "${CID:-}" \
     && echo "history cleanup done"
 elif [ -f "$DBF" ]; then
   echo "WARN: php CLI 不在のため履歴クリーンアップ未実行（PHP_BIN で指定可）"
