@@ -380,8 +380,27 @@ function mcp_error($id, int $code, string $message): void {
 }
 
 function handle_mcp(): void {
-    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
-        header('Allow: POST');
+    $reqMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+    if ($reqMethod === 'GET') {
+        // GETはSSE受信ストリーム（server-initiated messages）。短く保持して切断し、
+        // クライアントの自動再接続に任せる（共有サーバーで長時間占有できないため）
+        header('Content-Type: text/event-stream; charset=utf-8');
+        header('Cache-Control: no-cache');
+        header('X-Accel-Buffering: no');
+        if (function_exists('apache_setenv')) @apache_setenv('no-gzip', '1');
+        while (ob_get_level() > 0) ob_end_clean();
+        echo ": stream open\n\n";
+        flush();
+        for ($i = 0; $i < 4; $i++) {
+            sleep(5);
+            if (connection_aborted()) exit;
+            echo ": keep-alive\n\n";
+            flush();
+        }
+        exit;
+    }
+    if ($reqMethod !== 'POST') {
+        header('Allow: GET, POST');
         json_out(['error' => 'method not allowed'], 405);
     }
     $msg = json_decode((string)file_get_contents('php://input'), true);
@@ -399,6 +418,8 @@ function handle_mcp(): void {
 
     switch ($method) {
         case 'initialize':
+            // セッションIDは返すが検証はしない（ステートレス）。要求するクライアント対策
+            header('Mcp-Session-Id: ' . bin2hex(random_bytes(16)));
             $supported = ['2025-06-18', '2025-03-26', '2024-11-05'];
             $requested = $msg['params']['protocolVersion'] ?? '';
             mcp_result($id, [
