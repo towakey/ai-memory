@@ -809,7 +809,7 @@ function oauth_redirect_allowed(string $client_id, string $redirect_uri): bool {
         return is_array($uris) && in_array($redirect_uri, $uris, true);
     }
     $host = parse_url($redirect_uri, PHP_URL_HOST);
-    return is_string($host) && in_array(strtolower($host), ['gemini.google.com', 'accounts.google.com', 'oauth-redirect.googleusercontent.com', 'localhost', '127.0.0.1'], true);
+    return is_string($host) && in_array(strtolower($host), ['gemini.google.com', 'accounts.google.com', 'oauth-redirect.googleusercontent.com', 'chatgpt.com', 'chat.openai.com', 'localhost', '127.0.0.1'], true);
 }
 
 function handle_oauth_authorize(): void {
