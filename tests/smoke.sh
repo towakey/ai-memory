@@ -15,6 +15,15 @@ req() { curl -s -w $'\n%{http_code}' "$@"; } # body\nstatus
 status_of() { printf '%s' "$1" | tail -n1; }
 body_of() { printf '%s' "$1" | sed '$d'; }
 
+# ログ系テストのクリーンアップ基準（この実行で増えた行だけ消す。ローカルDBが読める時のみ）
+DIR="$(cd "$(dirname "$0")" && pwd)"
+DBF="$DIR/../data/memory.sqlite"
+PHP_BIN="${PHP_BIN:-php}"
+A_BASE=0; O_BASE=0
+if [ -f "$DBF" ] && command -v "$PHP_BIN" >/dev/null 2>&1; then
+  read -r A_BASE O_BASE <<< "$("$PHP_BIN" -r '$p=new PDO("sqlite:".$argv[1]);$t=array_column($p->query("SELECT name FROM sqlite_master")->fetchAll(),"name");$m=function($n)use($p,$t){return in_array($n,$t,true)?(int)$p->query("SELECT MAX(id) FROM $n")->fetchColumn():0;};echo $m("access_log")," ",$m("ops_log");' "$DBF" 2>/dev/null)"
+fi
+
 echo "== BASE: $BASE =="
 
 # --- 認証 ---
@@ -151,7 +160,8 @@ check "mcp notification -> 202" 202 "$(status_of "$resp")"
 resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":7,"method":"bogus/method"}')
 body_of "$resp" | grep -q '"code":-32601' && check "mcp unknown -32601" ok ok || check "mcp unknown -32601" ok missing
 
-check "mcp GET -> 405" 405 "$(code -H "$AUTH" "$BASE/mcp")"
+# GET /mcp はSSEストリーム（20秒で切断）なので max-time で打ち切ってヘッダだけ見る
+check "mcp GET -> SSE 200" 200 "$(code -H "$AUTH" --max-time 3 "$BASE/mcp")"
 
 # --- 403 (直アクセス拒否) ---
 check "config.php -> 403" 403 "$(code "$BASE/config.php")"
@@ -244,15 +254,64 @@ check "well-known pr -> 200" 200 "$(code "$BASE/.well-known/oauth-protected-reso
 hdr=$(curl -s -D - -o /dev/null "$BASE/api/memories")
 printf '%s' "$hdr" | tr -d '\r' | grep -qi '^www-authenticate:.*oauth-protected-resource' && check "401 WWW-Authenticate" ok ok || check "401 WWW-Authenticate" ok missing
 
+# --- アクセスログ/操作ログ/actor判定/updated_by ---
+# initialize の clientInfo が mcp_sessions に保存され、Mcp-Session-Id ヘッダで actor 解決される
+resp=$(curl -s -D - -o /dev/null -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":70,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke-client","version":"9.9"}}}')
+SID=$(printf '%s' "$resp" | tr -d '\r' | grep -i '^mcp-session-id:' | head -1 | awk '{print $2}' | tr -d '[:space:]')
+check "mcp session id issued" 32 "${#SID}"
+req -X POST -H "$AUTH" -H "Mcp-Session-Id: $SID" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"kv_set","arguments":{"key":"smoke_log","value":"x"}}}' >/dev/null
+# OAuthトークンで kv_set -> actor は client_name(smoke-oauth) または oauth:xxxxxxxx
+req -X POST -H "Authorization: Bearer $OATOKEN" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{"name":"kv_set","arguments":{"key":"smoke_log_oa","value":"x"}}}' >/dev/null
+# APIキー + User-Agent で REST POST -> actor は UA先頭トークン
+req -X POST -H "$AUTH" -A 'SmokeUA/1.0' -H 'Content-Type: application/json' "$BASE/api/memories" -d '{"key":"smoke_log_ua","content":"x"}' >/dev/null
+resp=$(req -H "$AUTH" "$BASE/api/memories")
+body_of "$resp" | grep -q '"updated_by"' && check "list has updated_by" ok ok || check "list has updated_by" ok missing
+
+# admin 画面のログ表示 + admin 経由 save で actor=admin
+jar2=$(mktemp)
+resp=$(req -c "$jar2" "$BASE/admin")
+csrf2=$(body_of "$resp" | grep -o 'name="csrf" value="[a-f0-9]*"' | head -1 | sed 's/.*value="//;s/"//')
+req -b "$jar2" -c "$jar2" -X POST "$BASE/admin" --data-urlencode "csrf=$csrf2" --data-urlencode "action=login" --data-urlencode "api_key=$TOKEN" >/dev/null
+resp=$(req -b "$jar2" -c "$jar2" "$BASE/admin")
+csrf2=$(body_of "$resp" | grep -o 'name="csrf" value="[a-f0-9]*"' | head -1 | sed 's/.*value="//;s/"//')
+body_of "$resp" | grep -q '操作ログ' && body_of "$resp" | grep -q 'アクセスログ' && check "admin log sections" ok ok || check "admin log sections" ok missing
+check "admin save for ops" 303 "$(code -b "$jar2" -c "$jar2" -X POST "$BASE/admin" --data-urlencode "csrf=$csrf2" --data-urlencode "action=save" --data-urlencode "key=smoke_log_adm" --data-urlencode "content=x")"
+rm -f "$jar2"
+
+# ops_log/access_log の中身確認（ローカルDB + php CLI がある時のみ）
+if [ -f "$DBF" ] && command -v "$PHP_BIN" >/dev/null 2>&1; then
+  mapfile -t L < <("$PHP_BIN" -r '
+    $p=new PDO("sqlite:".$argv[1]);
+    $g=function($sql,$a=[])use($p){$s=$p->prepare($sql);$s->execute($a);$v=$s->fetchColumn();return $v===false?"":$v;};
+    echo $g("SELECT actor FROM ops_log WHERE action=? AND key=? ORDER BY id DESC",["kv_set","smoke_log"]),"\n";
+    echo $g("SELECT actor FROM ops_log WHERE action=? AND key=? ORDER BY id DESC",["kv_set","smoke_log_oa"]),"\n";
+    echo $g("SELECT actor FROM ops_log WHERE action=? AND key=? ORDER BY id DESC",["kv_set","smoke_log_ua"]),"\n";
+    echo $g("SELECT actor FROM ops_log WHERE action=? AND key=? ORDER BY id DESC",["kv_set","smoke_log_adm"]),"\n";
+    echo $g("SELECT client_name FROM mcp_sessions WHERE session_id=?",[$argv[2]]),"\n";
+    echo $g("SELECT COUNT(*) FROM access_log WHERE path=? AND actor=?",["/api/memories","SmokeUA"]),"\n";
+    echo $g("SELECT updated_by FROM memories WHERE key=?",["smoke_log_ua"]),"\n";
+  ' "$DBF" "${SID:-}")
+  check "ops actor=mcp client" "smoke-client" "${L[0]:-}"
+  check "ops actor=oauth client" "smoke-oauth" "${L[1]:-}"
+  check "ops actor=UA head" "SmokeUA" "${L[2]:-}"
+  check "ops actor=admin" "admin" "${L[3]:-}"
+  check "mcp_sessions row" "smoke-client" "${L[4]:-}"
+  [ "${L[5]:-0}" -gt 0 ] && check "access_log recorded" ok ok || check "access_log recorded" ok "count=${L[5]:-0}"
+  check "updated_by stored" "SmokeUA" "${L[6]:-}"
+else
+  echo "SKIP: ops_log/access_log のDB確認は php CLI + ローカルDB がある時のみ"
+fi
+
 # --- クリーンアップ ---
 curl -s -X DELETE -H "$AUTH" "$BASE/api/memories/smoke_admin" >/dev/null
 curl -s -X DELETE -H "$AUTH" "$BASE/api/memories/smoke_hist" >/dev/null
 curl -s -X DELETE -H "$AUTH" "$BASE/api/memories/smoke_other" >/dev/null
+curl -s -X DELETE -H "$AUTH" "$BASE/api/memories/smoke_log" >/dev/null
+curl -s -X DELETE -H "$AUTH" "$BASE/api/memories/smoke_log_oa" >/dev/null
+curl -s -X DELETE -H "$AUTH" "$BASE/api/memories/smoke_log_ua" >/dev/null
+curl -s -X DELETE -H "$AUTH" "$BASE/api/memories/smoke_log_adm" >/dev/null
 
-# 履歴も掃除（ローカルDB限定: php CLIが使える時のみ）
-DIR="$(cd "$(dirname "$0")" && pwd)"
-DBF="$DIR/../data/memory.sqlite"
-PHP_BIN="${PHP_BIN:-php}"
+# 履歴も掃除（ローカルDB限定: php CLIが使える時のみ。ログは実行前の最大id以降だけ消す）
 if [ -f "$DBF" ] && command -v "$PHP_BIN" >/dev/null 2>&1; then
   "$PHP_BIN" -r '$pdo=new PDO("sqlite:".$argv[1]);$pdo->prepare("DELETE FROM memory_history WHERE key LIKE ?")->execute(["smoke%"]);$pdo->exec("DELETE FROM raw_logs WHERE content LIKE '"'"'smoke%'"'"'");
     $tables=array_column($pdo->query("SELECT name FROM sqlite_master")->fetchAll(),"name");
@@ -260,7 +319,10 @@ if [ -f "$DBF" ] && command -v "$PHP_BIN" >/dev/null 2>&1; then
       $pdo->prepare("DELETE FROM oauth_clients WHERE client_id=?")->execute([$argv[2]]);
       $pdo->prepare("DELETE FROM oauth_codes WHERE client_id=?")->execute([$argv[2]]);
       $pdo->prepare("DELETE FROM oauth_tokens WHERE client_id=?")->execute([$argv[2]]);
-    }' "$DBF" "${CID:-}" \
+    }
+    if(in_array("mcp_sessions",$tables,true)) $pdo->exec("DELETE FROM mcp_sessions WHERE client_name IN ('"'"'smoke-client'"'"','"'"'smoke'"'"')");
+    if(in_array("access_log",$tables,true)) $pdo->prepare("DELETE FROM access_log WHERE id > ?")->execute([(int)$argv[3]]);
+    if(in_array("ops_log",$tables,true)) $pdo->prepare("DELETE FROM ops_log WHERE id > ?")->execute([(int)$argv[4]]);' "$DBF" "${CID:-}" "${A_BASE:-0}" "${O_BASE:-0}" \
     && echo "history cleanup done"
 elif [ -f "$DBF" ]; then
   echo "WARN: php CLI 不在のため履歴クリーンアップ未実行（PHP_BIN で指定可）"

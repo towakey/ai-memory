@@ -65,6 +65,7 @@ function db(): PDO {
     // migrate.php 未適用の既存DB向けフォールバック（冪等）
     $cols = array_column($pdo->query('PRAGMA table_info(memories)')->fetchAll(), 'name');
     if (!in_array('category', $cols, true)) $pdo->exec('ALTER TABLE memories ADD COLUMN category TEXT');
+    if (!in_array('updated_by', $cols, true)) $pdo->exec('ALTER TABLE memories ADD COLUMN updated_by TEXT');
     // shortcut: 履歴は無期限保持、DBが肥大化したら古い履歴の削除を追加
     $pdo->exec('CREATE TABLE IF NOT EXISTS memory_history (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT NOT NULL)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS memory_history_key ON memory_history(key, id)');
@@ -76,6 +77,12 @@ function db(): PDO {
     $pdo->exec('CREATE TABLE IF NOT EXISTS oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL, created_at TEXT NOT NULL)');
     $pdo->exec('CREATE TABLE IF NOT EXISTS oauth_codes (code TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL, code_challenge TEXT, expires_at TEXT NOT NULL)');
     $pdo->exec('CREATE TABLE IF NOT EXISTS oauth_tokens (token TEXT PRIMARY KEY, client_id TEXT, created_at TEXT NOT NULL)');
+    // アクセスログ・操作ログ・MCPセッション（actor 判定用）
+    $pdo->exec('CREATE TABLE IF NOT EXISTS mcp_sessions (session_id TEXT PRIMARY KEY, client_name TEXT, client_version TEXT, created_at TEXT NOT NULL)');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS access_log (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, method TEXT, path TEXT, status INTEGER, actor TEXT, ua TEXT, ip TEXT)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS access_log_at ON access_log(at)');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS ops_log (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT, action TEXT NOT NULL, key TEXT, detail TEXT)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS ops_log_at ON ops_log(at)');
     return $pdo;
 }
 
@@ -88,11 +95,11 @@ function valid_content($content): bool {
 }
 
 function list_memories(): array {
-    return db()->query('SELECT key, updated_at FROM memories ORDER BY key')->fetchAll();
+    return db()->query('SELECT key, category, updated_at, updated_by FROM memories ORDER BY key')->fetchAll();
 }
 
 function get_memory(string $key): ?array {
-    $st = db()->prepare('SELECT key, content, updated_at FROM memories WHERE key = ?');
+    $st = db()->prepare('SELECT key, content, updated_at, updated_by FROM memories WHERE key = ?');
     $st->execute([$key]);
     $row = $st->fetch();
     return $row === false ? null : $row;
@@ -108,15 +115,16 @@ function save_memory(string $key, string $content, ?string $category = null): ar
         SELECT key, content, updated_at, ? FROM memories WHERE key = ? AND content <> ?')
         ->execute([$now, $key, $content]);
     if ($category === null) {
-        $pdo->prepare('INSERT INTO memories (key, content, updated_at, category) VALUES (?, ?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at')
-            ->execute([$key, $content, $now, 'general']);
+        $pdo->prepare('INSERT INTO memories (key, content, updated_at, category, updated_by) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at, updated_by = excluded.updated_by')
+            ->execute([$key, $content, $now, 'general', actor()]);
     } else {
-        $pdo->prepare('INSERT INTO memories (key, content, updated_at, category) VALUES (?, ?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at, category = excluded.category')
-            ->execute([$key, $content, $now, $category]);
+        $pdo->prepare('INSERT INTO memories (key, content, updated_at, category, updated_by) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at, category = excluded.category, updated_by = excluded.updated_by')
+            ->execute([$key, $content, $now, $category, actor()]);
     }
     $pdo->commit();
+    ops('kv_set', $key, 'category=' . ($category ?? memory_category($key) ?? ''));
     return ['key' => $key, 'content' => $content, 'updated_at' => $now];
 }
 
@@ -138,6 +146,7 @@ function add_memory_log(string $content, ?string $source_ai): int {
     $pdo = db();
     $pdo->prepare('INSERT INTO raw_logs (content, source_ai) VALUES (?, ?)')
         ->execute([$content, mb_substr(trim($source_ai), 0, 100)]);
+    ops('add_log', null, 'source_ai=' . $source_ai);
     return (int)$pdo->lastInsertId();
 }
 
@@ -185,6 +194,7 @@ function delete_memory(string $key): bool {
     $st->execute([$key]);
     $deleted = $st->rowCount() > 0;
     $pdo->commit();
+    if ($deleted) ops('kv_delete', $key, null);
     return $deleted;
 }
 
@@ -199,7 +209,9 @@ function restore_memory(string $key, int $id): ?array {
     $st->execute([$id, $key]);
     $row = $st->fetch();
     if ($row === false) return null;
-    return save_memory($key, $row['content']);
+    $saved = save_memory($key, $row['content']);
+    ops('restore', $key, 'id=' . $id);
+    return $saved;
 }
 
 // ---------- 認証 ----------
@@ -212,14 +224,15 @@ function request_token(): ?string {
 }
 
 function require_token(): void {
-    global $API_KEY;
+    global $API_KEY, $OAUTH_CLIENT_ID, $AUTHED;
     $token = request_token();
     if ($token !== null) {
-        if (hash_equals($API_KEY, $token)) return;
-        // OAuth で発行したアクセストークンも有効
-        $st = db()->prepare('SELECT 1 FROM oauth_tokens WHERE token = ?');
+        if (hash_equals($API_KEY, $token)) { $AUTHED = true; return; }
+        // OAuth で発行したアクセストークンも有効（actor 判定用に client_id を覚える）
+        $st = db()->prepare('SELECT client_id FROM oauth_tokens WHERE token = ?');
         $st->execute([$token]);
-        if ($st->fetchColumn() !== false) return;
+        $row = $st->fetch();
+        if ($row !== false) { $OAUTH_CLIENT_ID = $row['client_id']; $AUTHED = true; return; }
     }
     header('WWW-Authenticate: Bearer resource_metadata="' . origin() . '/.well-known/oauth-protected-resource"');
     json_out(['error' => 'unauthorized'], 401);
@@ -321,13 +334,13 @@ function mcp_call_tool(string $name, array $args): ?array {
     $enc = function ($v) { return json_encode($v, JSON_UNESCAPED_UNICODE); };
     switch ($name) {
         case 'kv_list':
-            return mcp_text($enc(db()->query('SELECT key, category, updated_at FROM memories ORDER BY key')->fetchAll()));
+            return mcp_text($enc(db()->query('SELECT key, category, updated_at, updated_by FROM memories ORDER BY key')->fetchAll()));
         case 'kv_get':
             $key = $args['key'] ?? null;
             $cat = $args['category'] ?? null;
             if (is_string($key) && $key !== '') {
                 if (!valid_key($key)) return mcp_text('invalid key', true);
-                $st = db()->prepare('SELECT key, content AS value, category, updated_at FROM memories WHERE key = ?');
+                $st = db()->prepare('SELECT key, content AS value, category, updated_at, updated_by FROM memories WHERE key = ?');
                 $st->execute([$key]);
                 $row = $st->fetch();
                 return $row === false ? mcp_text('not found', true) : mcp_text($enc($row));
@@ -418,15 +431,25 @@ function handle_mcp(): void {
 
     switch ($method) {
         case 'initialize':
-            // セッションIDは返すが検証はしない（ステートレス）。要求するクライアント対策
-            header('Mcp-Session-Id: ' . bin2hex(random_bytes(16)));
+            // セッションIDは返すが検証はしない（ステートレス）。clientInfo は actor 判定用に保存
+            $sid = bin2hex(random_bytes(16));
+            header('Mcp-Session-Id: ' . $sid);
+            $ci = $msg['params']['clientInfo'] ?? null;
+            $cname = is_array($ci) && isset($ci['name']) && is_string($ci['name']) && $ci['name'] !== ''
+                ? mb_substr($ci['name'], 0, 100) : 'unknown';
+            $cver = is_array($ci) && isset($ci['version']) && is_string($ci['version'])
+                ? mb_substr($ci['version'], 0, 50) : null;
+            try {
+                db()->prepare('INSERT INTO mcp_sessions (session_id, client_name, client_version, created_at) VALUES (?, ?, ?, ?)')
+                    ->execute([$sid, $cname, $cver, date('c')]);
+            } catch (Throwable $e) {}
             $supported = ['2025-06-18', '2025-03-26', '2024-11-05'];
             $requested = $msg['params']['protocolVersion'] ?? '';
             mcp_result($id, [
                 'protocolVersion' => in_array($requested, $supported, true) ? $requested : '2025-06-18',
                 'capabilities' => ['tools' => new stdClass],
                 'serverInfo' => ['name' => 'ai-memory', 'version' => '1.0.0'],
-                'instructions' => '複数のAIで共有する個人メモリ。確定事実はkv_*、その場限りのメモや好み・エピソードはadd_memory_log、曖昧検索はrecall_memories、近況俯瞰はget_recent_digests。上書き・削除は履歴に自動保存され、REST経由で復元可能',
+                'instructions' => '複数のAIで共有する個人メモリ。確定事実はkv_*、その場限りのメモや好み・エピソードはadd_memory_log、曖昧検索はrecall_memories、近況俯瞰はget_recent_digests。上書き・削除は履歴に自動保存され、REST経由で復元可能。操作履歴はops_logに自動記録',
             ]);
             break;
         case 'ping':
@@ -556,7 +579,7 @@ function admin_redirect(string $base): void {
 }
 
 function handle_admin(string $base): void {
-    global $API_KEY;
+    global $API_KEY, $ACTOR;
     session_name('aimemory');
     session_set_cookie_params([
         'path' => $base === '' ? '/' : $base . '/',
@@ -573,12 +596,14 @@ function handle_admin(string $base): void {
             http_response_code(403);
             exit('invalid csrf token');
         }
+        $ACTOR = 'admin';
         $action = $_POST['action'] ?? '';
         if ($action === 'login') {
             $key = $_POST['api_key'] ?? '';
             if (is_string($key) && hash_equals($API_KEY, $key)) {
                 session_regenerate_id(true);
                 $_SESSION['auth'] = true;
+                ops('admin_login', null, null);
             } else {
                 $_SESSION['flash'] = 'APIキーが違います';
             }
@@ -687,7 +712,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:#080808;border:1px sol
         exit;
     }
 
-    $mems = db()->query('SELECT key, content, updated_at FROM memories ORDER BY key')->fetchAll();
+    $mems = db()->query('SELECT key, content, updated_at, updated_by FROM memories ORDER BY key')->fetchAll();
     echo '<header><div class="stripe"></div><div class="hdr-in"><div>
 <span class="brand-sm">SHARED MEMORY SYSTEM</span><h1 class="brand">AI MEMORY</h1></div>
 <div class="hdr-right"><span class="status">UNITS: ' . count($mems) . '</span>
@@ -705,7 +730,8 @@ pre{white-space:pre-wrap;word-break:break-word;background:#080808;border:1px sol
     foreach ($mems as $m) {
         $rows = min(30, max(6, substr_count($m['content'], "\n") + 2));
         echo '<div class="mem" data-key="' . h($m['key']) . '">
-<div class="mem-head"><h3>' . h($m['key']) . '</h3><span class="t">updated: ' . h($m['updated_at']) . '</span></div>
+<div class="mem-head"><h3>' . h($m['key']) . '</h3><span class="t">updated: ' . h($m['updated_at'])
+        . (isset($m['updated_by']) && $m['updated_by'] !== '' ? ' by ' . h($m['updated_by']) : '') . '</span></div>
 <form method="post" class="pad"><input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="save"><input type="hidden" name="key" value="' . h($m['key']) . '">
 <label class="fld"><span>CONTENT</span><textarea name="content" rows="' . $rows . '">' . h($m['content']) . '</textarea></label>
 <div class="btn-row"><button type="submit" class="btn-primary">保存 SAVE</button>
@@ -714,6 +740,21 @@ pre{white-space:pre-wrap;word-break:break-word;background:#080808;border:1px sol
         . admin_history_html($m['key'], $csrf) . '</div>';
     }
     echo '</section>';
+
+    $opsRows = db()->query('SELECT at, actor, action, key, detail FROM ops_log ORDER BY id DESC LIMIT 50')->fetchAll();
+    $opsTotal = (int)db()->query('SELECT COUNT(*) FROM ops_log')->fetchColumn();
+    echo '<details class="hist"><summary>操作ログ OPS (' . $opsTotal . ')</summary><pre>';
+    foreach ($opsRows as $r) {
+        echo h($r['at'] . ' | ' . $r['actor'] . ' | ' . $r['action'] . ' | ' . $r['key'] . ' | ' . $r['detail']) . "\n";
+    }
+    echo '</pre></details>';
+    $accRows = db()->query('SELECT at, method, path, status, actor, ua FROM access_log ORDER BY id DESC LIMIT 50')->fetchAll();
+    $accTotal = (int)db()->query('SELECT COUNT(*) FROM access_log')->fetchColumn();
+    echo '<details class="hist"><summary>アクセスログ ACCESS (' . $accTotal . ')</summary><pre>';
+    foreach ($accRows as $r) {
+        echo h($r['at'] . ' | ' . $r['method'] . ' | ' . $r['path'] . ' | ' . $r['status'] . ' | ' . $r['actor'] . ' | ' . $r['ua']) . "\n";
+    }
+    echo '</pre></details>';
 
     echo '<h2 class="gone-h">DELETED UNITS // 削除済み</h2>';
     $gone = db()->query('SELECT h.key AS k FROM memory_history h LEFT JOIN memories m ON m.key = h.key WHERE m.key IS NULL GROUP BY h.key ORDER BY h.key');
@@ -819,6 +860,7 @@ function handle_oauth_authorize(): void {
     $code = bin2hex(random_bytes(32));
     db()->prepare('INSERT INTO oauth_codes (code, client_id, redirect_uri, code_challenge, expires_at) VALUES (?, ?, ?, ?, ?)')
         ->execute([$code, $client_id, $redirect_uri, $challenge, date('c', time() + 600)]);
+    ops('oauth_authorize', null, 'client_id=' . $client_id . ' redirect_host=' . (is_string($host) ? $host : ''));
     $sep = strpos($redirect_uri, '?') === false ? '?' : '&';
     $loc = $redirect_uri . $sep . 'code=' . rawurlencode($code);
     if ($state !== null) $loc .= '&state=' . rawurlencode($state);
@@ -860,6 +902,7 @@ function handle_oauth_token(): void {
     $token = bin2hex(random_bytes(32));
     db()->prepare('INSERT INTO oauth_tokens (token, client_id, created_at) VALUES (?, ?, ?)')
         ->execute([$token, $row['client_id'], date('c')]);
+    ops('oauth_token', null, 'client_id=' . $row['client_id']);
     // expires_in/refresh_token は省略（無期限扱い）
     json_out(['access_token' => $token, 'token_type' => 'Bearer']);
 }
@@ -879,6 +922,7 @@ function handle_oauth_register(): void {
     $client_id = bin2hex(random_bytes(16));
     db()->prepare('INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at) VALUES (?, ?, ?, ?)')
         ->execute([$client_id, $name, json_encode(array_values($uris)), date('c')]);
+    ops('oauth_register', null, 'client_id=' . $client_id . ' name=' . ($name ?? ''));
     json_out([
         'client_id' => $client_id,
         'client_name' => $name,
@@ -914,6 +958,66 @@ function handle_oauth_metadata(string $base, string $which): void {
         'bearer_methods_supported' => ['header'],
     ]);
 }
+
+// ---------- ログ（アクセス/操作/actor判定） ----------
+$ACTOR = null;            // actor() の結果キャッシュ。handle_admin が 'admin' に上書きする
+$OAUTH_CLIENT_ID = false; // OAuthトークン認証が通った時の client_id（APIキー認証・未認証では false のまま）
+$AUTHED = false;          // require_token() 通過フラグ（access_log の 'noauth' 判定用）
+
+// 操作者の推定: MCPセッション(clientInfo) > OAuthクライアント > User-Agent先頭トークン
+function actor(): string {
+    global $ACTOR, $OAUTH_CLIENT_ID;
+    if (is_string($ACTOR) && $ACTOR !== '') return $ACTOR;
+    $sid = $_SERVER['HTTP_MCP_SESSION_ID'] ?? '';
+    if ($sid !== '') {
+        try {
+            $st = db()->prepare('SELECT client_name FROM mcp_sessions WHERE session_id = ?');
+            $st->execute([$sid]);
+            $name = $st->fetchColumn();
+            if (is_string($name) && $name !== '') return $ACTOR = $name;
+        } catch (Throwable $e) {}
+    }
+    if ($OAUTH_CLIENT_ID !== false) {
+        if (is_string($OAUTH_CLIENT_ID) && $OAUTH_CLIENT_ID !== '') {
+            try {
+                $st = db()->prepare('SELECT client_name FROM oauth_clients WHERE client_id = ?');
+                $st->execute([$OAUTH_CLIENT_ID]);
+                $name = $st->fetchColumn();
+                if (is_string($name) && $name !== '') return $ACTOR = $name;
+            } catch (Throwable $e) {}
+            return $ACTOR = 'oauth:' . substr($OAUTH_CLIENT_ID, 0, 8);
+        }
+        return $ACTOR = 'oauth';
+    }
+    $ua = trim((string)($_SERVER['HTTP_USER_AGENT'] ?? ''));
+    $first = $ua === '' ? '' : (preg_split('#[\s/]#', $ua)[0] ?? '');
+    return $ACTOR = $first === '' ? 'manual' : $first;
+}
+
+// 操作ログ記録（ログ失敗で本体処理を止めない）
+function ops(string $action, ?string $key = null, ?string $detail = null): void {
+    try {
+        db()->prepare('INSERT INTO ops_log (at, actor, action, key, detail) VALUES (?, ?, ?, ?, ?)')
+            ->execute([date('c'), actor(), $action, $key, $detail]);
+    } catch (Throwable $e) {}
+}
+
+// 全リクエストのアクセスログ（終了時に記録。$path はクエリ除去済みで ?token= 等は入らない。ログ用DBエラーは無視）
+register_shutdown_function(static function () use ($path) {
+    global $ACTOR, $AUTHED;
+    try {
+        $act = is_string($ACTOR) && $ACTOR !== '' ? $ACTOR : (!empty($AUTHED) ? actor() : 'noauth');
+        db()->prepare('INSERT INTO access_log (at, method, path, status, actor, ua, ip) VALUES (?, ?, ?, ?, ?, ?, ?)')
+            ->execute([date('c'), $_SERVER['REQUEST_METHOD'] ?? '?', $path, (int)http_response_code(),
+                $act, mb_substr(trim((string)($_SERVER['HTTP_USER_AGENT'] ?? '')), 0, 200), $_SERVER['REMOTE_ADDR'] ?? null]);
+        // shortcut: 30日より古いログを1/50の確率で掃除。長期保持が必要になったらアーカイブ先を検討
+        if (random_int(1, 50) === 1) {
+            $old = date('c', time() - 30 * 86400);
+            db()->prepare('DELETE FROM access_log WHERE at < ?')->execute([$old]);
+            db()->prepare('DELETE FROM ops_log WHERE at < ?')->execute([$old]);
+        }
+    } catch (Throwable $e) {}
+});
 
 // ---------- ルーティング ----------
 if ($path === '/openapi.json') send_openapi($BASE);
