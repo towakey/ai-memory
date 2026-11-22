@@ -151,6 +151,12 @@ body_of "$resp" | grep -q '"id":' && check "mcp add_memory_log" ok ok || check "
 resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":62,"method":"tools/call","params":{"name":"recall_memories","arguments":{"query":"smoke"}}}')
 body_of "$resp" | grep -q '"text":"\[' && check "mcp recall_memories" ok ok || check "mcp recall_memories" ok "$(body_of "$resp")"
 
+# ベクトル検索: LIKE「図鑑アプリ」は「図鑑を作っている」に一致しないがbigram類似ではヒットする
+# ※日本語は \uXXXX エスケープ（Git Bash の curl -d 文字化け対策）
+resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":64,"method":"tools/call","params":{"name":"add_memory_log","arguments":{"content":"smokevec \u56f3\u9451\u3092\u4f5c\u3063\u3066\u3044\u308b\u500b\u4eba\u958b\u767a\u306e\u8a18\u9332","source_ai":"smoke-test"}}}' >/dev/null)
+resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"recall_memories","arguments":{"query":"\u56f3\u9451\u30a2\u30d7\u30ea","limit":10}}}')
+body_of "$resp" | grep -q 'smokevec' && check "mcp recall vector hit" ok ok || check "mcp recall vector hit" ok "$(body_of "$resp")"
+
 resp=$(req -X POST -H "$AUTH" -H 'Content-Type: application/json' "$BASE/mcp" -d '{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"get_recent_digests","arguments":{}}}')
 body_of "$resp" | grep -q '"text":"\[' && check "mcp get_recent_digests" ok ok || check "mcp get_recent_digests" ok "$(body_of "$resp")"
 

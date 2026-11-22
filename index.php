@@ -150,26 +150,79 @@ function add_memory_log(string $content, ?string $source_ai): int {
     return (int)$pdo->lastInsertId();
 }
 
-// Embedding 未実装のため summary/tags の LIKE キーワード検索のみ
+// 純PHP簡易ベクトル化: 文字bigram＋英数単語をハッシュした固定次元スパースベクトル。
+// 外部API不要だが意味的類似は弱い。LLM系embeddingに移行する場合は embed_text だけ差し替える
+const EMBED_DIM = 1024;
+
+function embed_text(string $text): array {
+    $t = mb_strtolower(mb_convert_kana($text, 'as'));
+    $vec = [];
+    $add = function (string $term, float $w) use (&$vec): void {
+        $vec[abs(crc32($term)) % EMBED_DIM] = ($vec[abs(crc32($term)) % EMBED_DIM] ?? 0) + $w;
+    };
+    if (preg_match_all('/[a-z0-9_]{2,}/', $t, $m)) {
+        foreach ($m[0] as $w) $add('w:' . $w, 1.5);
+    }
+    $chars = preg_replace('/\s+/u', '', $t);
+    $len = mb_strlen($chars);
+    if ($len < 3) {
+        for ($i = 0; $i < $len; $i++) $add('u:' . mb_substr($chars, $i, 1), 1.0);
+    }
+    for ($i = 0; $i + 1 < $len; $i++) {
+        $add('b:' . mb_substr($chars, $i, 2), 1.0);
+    }
+    $norm = sqrt(array_sum(array_map(fn($v) => $v * $v, $vec)));
+    if ($norm > 0) foreach ($vec as $i => $v) $vec[$i] = $v / $norm;
+    return $vec;
+}
+
+// 両ベクトルはL2正規化済み前提で内積=cosine
+function vec_cos(array $a, array $b): float {
+    if ($a === [] || $b === []) return 0.0;
+    if (count($a) > count($b)) { $t = $a; $a = $b; $b = $t; }
+    $dot = 0.0;
+    foreach ($a as $i => $v) if (isset($b[$i])) $dot += $v * $b[$i];
+    return $dot;
+}
+
+// semantic_memories + 確定メモ + 生ログを簡易ベクトル類似度で横断検索
 function recall_memories(string $query, int $limit = 5): array {
     $limit = max(1, min(20, $limit));
-    $words = array_values(array_filter(
-        preg_split('/\s+/u', trim($query)) ?: [],
-        fn($w) => $w !== ''
-    ));
-    if ($words === []) return [];
-    $where = [];
-    $params = [];
-    foreach (array_slice($words, 0, 10) as $w) {
-        $where[] = "(summary LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')";
-        $p = '%' . addcslashes($w, '\\%_') . '%';
-        $params[] = $p;
-        $params[] = $p;
+    $qv = embed_text(trim($query));
+    if ($qv === []) return [];
+    $pdo = db();
+    $now = time();
+    $out = [];
+
+    foreach ($pdo->query('SELECT id, summary, category, tags, importance, embedding_json, updated_at FROM semantic_memories')->fetchAll() as $r) {
+        $vec = is_string($r['embedding_json']) ? json_decode($r['embedding_json'], true) : null;
+        if (!is_array($vec) || $vec === []) {
+            $vec = embed_text($r['summary'] . ' ' . (string)($r['tags'] ?? ''));
+            $pdo->prepare('UPDATE semantic_memories SET embedding_json = ? WHERE id = ?')
+                ->execute([json_encode($vec), $r['id']]);
+        }
+        $s = vec_cos($qv, $vec) * (0.7 + 0.1 * (int)$r['importance']);
+        if ($s > 0.03) $out[] = ['source' => 'semantic', 'id' => (int)$r['id'], 'summary' => $r['summary'],
+            'category' => $r['category'], 'tags' => $r['tags'], 'importance' => (int)$r['importance'],
+            'updated_at' => $r['updated_at'], 'score' => round($s, 4)];
     }
-    $st = db()->prepare('SELECT id, summary, category, tags, importance, updated_at FROM semantic_memories
-        WHERE ' . implode(' OR ', $where) . ' ORDER BY importance DESC, updated_at DESC LIMIT ' . $limit);
-    $st->execute($params);
-    return $st->fetchAll();
+
+    foreach ($pdo->query('SELECT key, content, category, updated_at FROM memories')->fetchAll() as $r) {
+        $s = vec_cos($qv, embed_text($r['key'] . ' ' . (string)($r['category'] ?? '') . ' ' . $r['content']));
+        if ($s > 0.03) $out[] = ['source' => 'kv', 'key' => $r['key'], 'summary' => mb_substr($r['content'], 0, 300),
+            'category' => $r['category'], 'updated_at' => $r['updated_at'], 'score' => round($s, 4)];
+    }
+
+    // shortcut: 生ログは直近500件のみ走査。件数が増えて重くなったらembedding列を追加してキャッシュする
+    foreach ($pdo->query('SELECT id, content, source_ai, created_at FROM raw_logs ORDER BY id DESC LIMIT 500')->fetchAll() as $r) {
+        $age = max(0, $now - strtotime((string)$r['created_at']));
+        $s = vec_cos($qv, embed_text($r['content'])) * 0.8 * (0.7 + 0.3 * exp(-$age / (90 * 86400)));
+        if ($s > 0.03) $out[] = ['source' => 'log', 'id' => (int)$r['id'], 'summary' => mb_substr($r['content'], 0, 300),
+            'source_ai' => $r['source_ai'], 'created_at' => $r['created_at'], 'score' => round($s, 4)];
+    }
+
+    usort($out, fn($a, $b) => $b['score'] <=> $a['score']);
+    return array_slice($out, 0, $limit);
 }
 
 function get_recent_digests(?string $period_type, int $limit = 5): array {
@@ -297,11 +350,11 @@ function mcp_tools(): array {
         ],
         [
             'name' => 'recall_memories',
-            'description' => 'エピソード・好みなど曖昧な記憶を検索します。現在はキーワード検索（ベクトル検索は未実装）。query を空白区切りの各語で OR 検索し importance 順で返します。確定記憶は kv_list / kv_get を使ってください',
+            'description' => '曖昧な記憶を簡易ベクトル類似検索します（文字bigram類似。LLM系embedding未使用）。semantic記憶・確定メモ(kv)・生ログを横断し score 順に返します。結果の key で kv_get すれば全文取得できます',
             'inputSchema' => [
                 'type' => 'object',
                 'properties' => [
-                    'query' => ['type' => 'string', 'description' => '検索語（空白区切りでOR検索）'],
+                    'query' => ['type' => 'string', 'description' => '検索語（日本語そのまま可）'],
                     'limit' => ['type' => 'integer', 'description' => '最大件数（デフォルト5・上限20）'],
                 ],
                 'required' => ['query'],
