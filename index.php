@@ -66,11 +66,14 @@ function db(): PDO {
     $cols = array_column($pdo->query('PRAGMA table_info(memories)')->fetchAll(), 'name');
     if (!in_array('category', $cols, true)) $pdo->exec('ALTER TABLE memories ADD COLUMN category TEXT');
     if (!in_array('updated_by', $cols, true)) $pdo->exec('ALTER TABLE memories ADD COLUMN updated_by TEXT');
+    if (!in_array('embedding_json', $cols, true)) $pdo->exec('ALTER TABLE memories ADD COLUMN embedding_json TEXT');
     // shortcut: 履歴は無期限保持、DBが肥大化したら古い履歴の削除を追加
     $pdo->exec('CREATE TABLE IF NOT EXISTS memory_history (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT NOT NULL)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS memory_history_key ON memory_history(key, id)');
     // 新記憶層（migrate.sql と同じ定義、冪等）
     $pdo->exec("CREATE TABLE IF NOT EXISTS raw_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, source_ai TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')), processed_at TEXT)");
+    $lcols = array_column($pdo->query('PRAGMA table_info(raw_logs)')->fetchAll(), 'name');
+    if (!in_array('embedding_json', $lcols, true)) $pdo->exec('ALTER TABLE raw_logs ADD COLUMN embedding_json TEXT');
     $pdo->exec('CREATE TABLE IF NOT EXISTS semantic_memories (id INTEGER PRIMARY KEY AUTOINCREMENT, summary TEXT NOT NULL, category TEXT, tags TEXT, importance INTEGER NOT NULL DEFAULT 3, embedding_json TEXT, updated_at TEXT)');
     $pdo->exec("CREATE TABLE IF NOT EXISTS periodic_digests (id INTEGER PRIMARY KEY AUTOINCREMENT, period_type TEXT NOT NULL, period_label TEXT NOT NULL, digest_text TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))");
     // OAuth 2.0 (Authorization Code + PKCE) 用テーブル
@@ -114,14 +117,16 @@ function save_memory(string $key, string $content, ?string $category = null): ar
     $pdo->prepare('INSERT INTO memory_history (key, content, updated_at, archived_at)
         SELECT key, content, updated_at, ? FROM memories WHERE key = ? AND content <> ?')
         ->execute([$now, $key, $content]);
+    $effCat = $category ?? memory_category($key) ?? 'general';
+    $emb = json_encode(embed_text($key . ' ' . $effCat . ' ' . $content));
     if ($category === null) {
-        $pdo->prepare('INSERT INTO memories (key, content, updated_at, category, updated_by) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at, updated_by = excluded.updated_by')
-            ->execute([$key, $content, $now, 'general', actor()]);
+        $pdo->prepare('INSERT INTO memories (key, content, updated_at, category, updated_by, embedding_json) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at, updated_by = excluded.updated_by, embedding_json = excluded.embedding_json')
+            ->execute([$key, $content, $now, 'general', actor(), $emb]);
     } else {
-        $pdo->prepare('INSERT INTO memories (key, content, updated_at, category, updated_by) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at, category = excluded.category, updated_by = excluded.updated_by')
-            ->execute([$key, $content, $now, $category, actor()]);
+        $pdo->prepare('INSERT INTO memories (key, content, updated_at, category, updated_by, embedding_json) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at, category = excluded.category, updated_by = excluded.updated_by, embedding_json = excluded.embedding_json')
+            ->execute([$key, $content, $now, $category, actor(), $emb]);
     }
     $pdo->commit();
     ops('kv_set', $key, 'category=' . ($category ?? memory_category($key) ?? ''));
@@ -144,8 +149,8 @@ function add_memory_log(string $content, ?string $source_ai): int {
         $source_ai = $first === '' ? 'unknown' : $first;
     }
     $pdo = db();
-    $pdo->prepare('INSERT INTO raw_logs (content, source_ai) VALUES (?, ?)')
-        ->execute([$content, mb_substr(trim($source_ai), 0, 100)]);
+    $pdo->prepare('INSERT INTO raw_logs (content, source_ai, embedding_json) VALUES (?, ?, ?)')
+        ->execute([$content, mb_substr(trim($source_ai), 0, 100), json_encode(embed_text($content))]);
     ops('add_log', null, 'source_ai=' . $source_ai);
     return (int)$pdo->lastInsertId();
 }
@@ -207,22 +212,71 @@ function recall_memories(string $query, int $limit = 5): array {
             'updated_at' => $r['updated_at'], 'score' => round($s, 4)];
     }
 
-    foreach ($pdo->query('SELECT key, content, category, updated_at FROM memories')->fetchAll() as $r) {
-        $s = vec_cos($qv, embed_text($r['key'] . ' ' . (string)($r['category'] ?? '') . ' ' . $r['content']));
+    foreach ($pdo->query('SELECT key, content, category, updated_at, embedding_json FROM memories')->fetchAll() as $r) {
+        $vec = is_string($r['embedding_json']) ? json_decode($r['embedding_json'], true) : null;
+        if (!is_array($vec) || $vec === []) {
+            $vec = embed_text($r['key'] . ' ' . (string)($r['category'] ?? '') . ' ' . $r['content']);
+            $pdo->prepare('UPDATE memories SET embedding_json = ? WHERE key = ?')
+                ->execute([json_encode($vec), $r['key']]);
+        }
+        $s = vec_cos($qv, $vec);
         if ($s > 0.03) $out[] = ['source' => 'kv', 'key' => $r['key'], 'summary' => mb_substr($r['content'], 0, 300),
             'category' => $r['category'], 'updated_at' => $r['updated_at'], 'score' => round($s, 4)];
     }
 
-    // shortcut: 生ログは直近500件のみ走査。件数が増えて重くなったらembedding列を追加してキャッシュする
-    foreach ($pdo->query('SELECT id, content, source_ai, created_at FROM raw_logs ORDER BY id DESC LIMIT 500')->fetchAll() as $r) {
+    // shortcut: 生ログは直近500件のみ走査。件数が増えて重くなったら古いログのベクトル化を間引く
+    foreach ($pdo->query('SELECT id, content, source_ai, created_at, embedding_json FROM raw_logs ORDER BY id DESC LIMIT 500')->fetchAll() as $r) {
+        $vec = is_string($r['embedding_json']) ? json_decode($r['embedding_json'], true) : null;
+        if (!is_array($vec) || $vec === []) {
+            $vec = embed_text($r['content']);
+            $pdo->prepare('UPDATE raw_logs SET embedding_json = ? WHERE id = ?')
+                ->execute([json_encode($vec), $r['id']]);
+        }
         $age = max(0, $now - strtotime((string)$r['created_at']));
-        $s = vec_cos($qv, embed_text($r['content'])) * 0.8 * (0.7 + 0.3 * exp(-$age / (90 * 86400)));
+        $s = vec_cos($qv, $vec) * 0.8 * (0.7 + 0.3 * exp(-$age / (90 * 86400)));
         if ($s > 0.03) $out[] = ['source' => 'log', 'id' => (int)$r['id'], 'summary' => mb_substr($r['content'], 0, 300),
             'source_ai' => $r['source_ai'], 'created_at' => $r['created_at'], 'score' => round($s, 4)];
     }
 
     usort($out, fn($a, $b) => $b['score'] <=> $a['score']);
     return array_slice($out, 0, $limit);
+}
+
+// 未ベクトル化の行をまとめて埋める（管理画面 VECTORIZE ボタン用）
+function vectorize_missing(): array {
+    $pdo = db();
+    $done = ['semantic' => 0, 'kv' => 0, 'log' => 0];
+    $jobs = [
+        'semantic' => ["SELECT id, summary, tags FROM semantic_memories WHERE embedding_json IS NULL OR embedding_json = ''",
+            'UPDATE semantic_memories SET embedding_json = ? WHERE id = ?',
+            fn($r) => $r['summary'] . ' ' . (string)($r['tags'] ?? '')],
+        'kv' => ["SELECT key, content, category FROM memories WHERE embedding_json IS NULL OR embedding_json = ''",
+            'UPDATE memories SET embedding_json = ? WHERE key = ?',
+            fn($r) => $r['key'] . ' ' . (string)($r['category'] ?? '') . ' ' . $r['content']],
+        'log' => ["SELECT id, content FROM raw_logs WHERE embedding_json IS NULL OR embedding_json = ''",
+            'UPDATE raw_logs SET embedding_json = ? WHERE id = ?',
+            fn($r) => $r['content']],
+    ];
+    foreach ($jobs as $name => [$sel, $upd, $text]) {
+        $st = $pdo->prepare($upd);
+        foreach ($pdo->query($sel)->fetchAll() as $r) {
+            $st->execute([json_encode(embed_text($text($r))), $r['id'] ?? $r['key']]);
+            $done[$name]++;
+        }
+    }
+    ops('vectorize', null, 'semantic=' . $done['semantic'] . ' kv=' . $done['kv'] . ' log=' . $done['log']);
+    return $done;
+}
+
+function embedding_status(): array {
+    $pdo = db();
+    $status = [];
+    foreach (['memories' => 'kv', 'semantic_memories' => 'semantic', 'raw_logs' => 'log'] as $t => $label) {
+        $total = (int)$pdo->query("SELECT COUNT(*) FROM $t")->fetchColumn();
+        $emb = (int)$pdo->query("SELECT COUNT(*) FROM $t WHERE embedding_json IS NOT NULL AND embedding_json <> ''")->fetchColumn();
+        $status[] = "$label $emb/$total";
+    }
+    return $status;
 }
 
 function get_recent_digests(?string $period_type, int $limit = 5): array {
@@ -687,6 +741,10 @@ function handle_admin(string $base): void {
                 $key = $_POST['key'] ?? '';
                 if (valid_key($key)) delete_memory($key);
                 break;
+            case 'vectorize':
+                $n = vectorize_missing();
+                $_SESSION['flash'] = 'ベクトル化しました（kv ' . $n['kv'] . '件 / semantic ' . $n['semantic'] . '件 / log ' . $n['log'] . '件）';
+                break;
             case 'save_client_instructions':
                 $c = $_POST['client'] ?? '';
                 $content = $_POST['content'] ?? '';
@@ -795,6 +853,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:#080808;border:1px sol
     echo '<header><div class="stripe"></div><div class="hdr-in"><div>
 <span class="brand-sm">SHARED MEMORY SYSTEM</span><h1 class="brand">AI MEMORY</h1></div>
 <div class="hdr-right"><span class="status">UNITS: ' . count($mems) . '</span>
+<form method="post"><input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="vectorize"><input type="hidden" name="page" value="' . h($page) . '"><button type="submit" class="btn-ghost">VECTORIZE</button></form>
 <form method="post"><input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="logout"><button type="submit" class="btn-ghost">LOGOUT</button></form></div></div>
 <nav class="tabs"><a href="' . h($base) . '/admin"' . ($page === '' ? ' class="on"' : '') . '>UNITS</a><a href="' . h($base) . '/admin?page=instructions"' . ($page === 'instructions' ? ' class="on"' : '') . '>INSTRUCTIONS</a><a href="' . h($base) . '/admin?page=history"' . ($page === 'history' ? ' class="on"' : '') . '>HISTORY</a><a href="' . h($base) . '/admin?page=logs"' . ($page === 'logs' ? ' class="on"' : '') . '>LOGS</a></nav></header>';
     echo '<main>';
@@ -860,6 +919,8 @@ pre{white-space:pre-wrap;word-break:break-word;background:#080808;border:1px sol
             echo h($r['at'] . ' | ' . $r['actor'] . ' | ' . $r['action'] . ' | ' . $r['key'] . ' | ' . $r['detail']) . "\n";
         }
         echo '</pre>';
+        echo '<h2 class="log-h">EMBEDDINGS（ベクトル化状況 → ヘッダーのVECTORIZEで未分を生成）</h2><pre>'
+            . h(implode('   ', embedding_status())) . '</pre>';
         $accRows = db()->query('SELECT at, method, path, status, actor, ua FROM access_log ORDER BY id DESC LIMIT 100')->fetchAll();
         $accTotal = (int)db()->query('SELECT COUNT(*) FROM access_log')->fetchColumn();
         echo '<h2 class="log-h">アクセスログ ACCESS (' . $accTotal . ')</h2><pre>';
