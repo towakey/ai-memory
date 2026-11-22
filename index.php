@@ -553,7 +553,21 @@ function handle_mcp(): void {
             $supported = ['2025-06-18', '2025-03-26', '2024-11-05'];
             $requested = $msg['params']['protocolVersion'] ?? '';
             // 指示はメモリから動的に組み立て: instructions=全AI共通、instructions.<client名小文字>=個別
-            $inst = '複数のAIで共有する個人メモリ。確定事実はkv_*、その場限りのメモや好み・エピソードはadd_memory_log、曖昧検索はrecall_memories、近況俯瞰はget_recent_digests。上書き・削除は履歴に自動保存され、REST経由で復元可能。操作履歴はops_logに自動記録';
+            $inst = 'あなたは複数のAIで共有する個人メモリ「ai-memory」に接続しています。
+
+## ツール
+- kv_list / kv_get / kv_set / kv_delete: 確定した事実・設定・プロジェクト状態の読み書き（キー+テキスト、category任意）。上書き・削除された旧内容は履歴に自動保存され、REST/管理画面で復元可能
+- add_memory_log: エピソード・好み・作業メモを追記するだけの生ログ
+- recall_memories: 記憶の類似検索（文字bigramベクトルで kv・semantic・生ログを横断し {source, score} 付きで返す）。曖昧な「あれなんだっけ」用。文字が似た語は拾えるが、表記が違う同義語は拾えない
+- get_recent_digests: 日次/週次の要約取得
+
+## 指示の読み方
+このinstructionsは接続時点のものです。全AI共通の指示はキー `instructions`、あなた専用の指示は `instructions.<自分のclientInfo名を小文字化し英数と_.-以外を-にしたもの>` というメモリに保存され、会話の途中で更新されることがあります。会話開始時、および定期的に kv_get で読み直して最新の指示に従ってください。
+
+## ルール
+- パスワード・APIキー・トークン・秘密鍵は絶対に保存しない
+- 書き込みは日本語・箇条書き中心。予定や状態には日付（YYYY-MM-DD）を付ける
+- あなたの操作は clientInfo の名前で ops_log に記録されます';
             $g = get_memory('instructions');
             if ($g !== null) $inst .= "\n\n## 全AI共通の指示\n" . $g['content'];
             $ckey = 'instructions.' . preg_replace('/[^a-z0-9_.-]+/', '-', strtolower(trim($cname)));
