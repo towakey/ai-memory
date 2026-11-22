@@ -274,7 +274,7 @@ csrf2=$(body_of "$resp" | grep -o 'name="csrf" value="[a-f0-9]*"' | head -1 | se
 req -b "$jar2" -c "$jar2" -X POST "$BASE/admin" --data-urlencode "csrf=$csrf2" --data-urlencode "action=login" --data-urlencode "api_key=$TOKEN" >/dev/null
 resp=$(req -b "$jar2" -c "$jar2" "$BASE/admin")
 csrf2=$(body_of "$resp" | grep -o 'name="csrf" value="[a-f0-9]*"' | head -1 | sed 's/.*value="//;s/"//')
-body_of "$resp" | grep -q '操作ログ' && body_of "$resp" | grep -q 'アクセスログ' && check "admin log sections" ok ok || check "admin log sections" ok missing
+resp=$(req -b "$jar2" -c "$jar2" "$BASE/admin?page=logs"); body_of "$resp" | grep -q '操作ログ' && body_of "$resp" | grep -q 'アクセスログ' && check "admin log sections" ok ok || check "admin log sections" ok missing
 check "admin save for ops" 303 "$(code -b "$jar2" -c "$jar2" -X POST "$BASE/admin" --data-urlencode "csrf=$csrf2" --data-urlencode "action=save" --data-urlencode "key=smoke_log_adm" --data-urlencode "content=x")"
 rm -f "$jar2"
 

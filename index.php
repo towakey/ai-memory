@@ -565,7 +565,7 @@ function h(string $s): string {
     return htmlspecialchars($s, ENT_QUOTES, 'UTF-8');
 }
 
-function admin_history_html(string $key, string $csrf): string {
+function admin_history_html(string $key, string $csrf, string $page = ''): string {
     $hist = get_history($key);
     $html = '<details class="hist"><summary>履歴 HISTORY (' . count($hist) . ')</summary>';
     foreach ($hist as $h) {
@@ -575,13 +575,14 @@ function admin_history_html(string $key, string $csrf): string {
             . '<form method="post" onsubmit="return confirm(\'この版に復元しますか？\')">'
             . '<input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="restore">'
             . '<input type="hidden" name="key" value="' . h($key) . '"><input type="hidden" name="id" value="' . (int)$h['id'] . '">'
+            . ($page !== '' ? '<input type="hidden" name="page" value="' . h($page) . '">' : '')
             . '<button type="submit" class="btn-restore">この版に復元 RESTORE</button></form></div>';
     }
     return $html . '</details>';
 }
 
-function admin_redirect(string $base): void {
-    header('Location: ' . $base . '/admin', true, 303);
+function admin_redirect(string $base, string $page = ''): void {
+    header('Location: ' . $base . '/admin' . ($page !== '' ? '?page=' . rawurlencode($page) : ''), true, 303);
     exit;
 }
 
@@ -646,7 +647,8 @@ function handle_admin(string $base): void {
                 session_destroy();
                 break;
         }
-        admin_redirect($base);
+        $ret = in_array($_POST['page'] ?? '', ['history', 'logs'], true) ? (string)$_POST['page'] : '';
+        admin_redirect($base, $ret);
     }
 
     $flash = $_SESSION['flash'] ?? null;
@@ -705,6 +707,10 @@ pre{white-space:pre-wrap;word-break:break-word;background:#080808;border:1px sol
 .login-panel .sub{color:var(--dim);letter-spacing:.32em;font-size:10px;margin:0 0 22px}
 .login-panel form{padding:0 28px;display:grid;gap:16px;text-align:left}
 .login-panel .flash{margin:0 28px 16px}
+.tabs{display:flex;gap:2px;max-width:960px;margin:0 auto;padding:0 16px}
+.tabs a{display:block;padding:9px 18px;color:var(--dim);text-decoration:none;letter-spacing:.18em;font-size:12px;border-top:2px solid transparent}
+.tabs a.on{color:var(--orange);border-top-color:var(--orange);background:#0f0f0f}
+.log-h{color:var(--orange);letter-spacing:.2em;font-size:13px;margin:26px 0 10px}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style></head><body>';
 
@@ -719,14 +725,46 @@ pre{white-space:pre-wrap;word-break:break-word;background:#080808;border:1px sol
         exit;
     }
 
+    $page = in_array($_GET['page'] ?? '', ['history', 'logs'], true) ? (string)$_GET['page'] : '';
     $mems = db()->query('SELECT key, content, updated_at, updated_by FROM memories ORDER BY key')->fetchAll();
     echo '<header><div class="stripe"></div><div class="hdr-in"><div>
 <span class="brand-sm">SHARED MEMORY SYSTEM</span><h1 class="brand">AI MEMORY</h1></div>
 <div class="hdr-right"><span class="status">UNITS: ' . count($mems) . '</span>
-<form method="post"><input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="logout"><button type="submit" class="btn-ghost">LOGOUT</button></form></div></div></header>';
+<form method="post"><input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="logout"><button type="submit" class="btn-ghost">LOGOUT</button></form></div></div>
+<nav class="tabs"><a href="' . h($base) . '/admin"' . ($page === '' ? ' class="on"' : '') . '>UNITS</a><a href="' . h($base) . '/admin?page=history"' . ($page === 'history' ? ' class="on"' : '') . '>HISTORY</a><a href="' . h($base) . '/admin?page=logs"' . ($page === 'logs' ? ' class="on"' : '') . '>LOGS</a></nav></header>';
     echo '<main>';
     if ($flash !== null) echo '<div class="flash"><b>WARNING</b> ' . h($flash) . '</div>';
-    echo '<details class="new-unit"><summary>+ NEW UNIT</summary>
+
+    if ($page === 'history') {
+        echo '<h2 class="gone-h">DELETED UNITS // 削除済み</h2>';
+        $gone = db()->query('SELECT h.key AS k FROM memory_history h LEFT JOIN memories m ON m.key = h.key WHERE m.key IS NULL GROUP BY h.key ORDER BY h.key');
+        foreach ($gone->fetchAll() as $g) {
+            echo '<div class="mem gone"><div class="mem-head"><h3>' . h($g['k']) . '</h3></div>' . admin_history_html($g['k'], $csrf, 'history') . '</div>';
+        }
+    } elseif ($page === 'logs') {
+        $clients = db()->query('SELECT client_name, COUNT(*) n, MAX(created_at) last FROM mcp_sessions GROUP BY client_name ORDER BY last DESC')->fetchAll();
+        echo '<h2 class="log-h">CONNECTED CLIENTS（instructions.&lt;client&gt; キー名の参考）</h2><pre>';
+        foreach ($clients as $c) {
+            $norm = preg_replace('/[^a-z0-9_.-]+/', '-', strtolower(trim((string)$c['client_name'])));
+            echo h($c['client_name'] . ' -> instructions.' . $norm . '  (' . $c['n'] . ' sessions, last ' . $c['last'] . ')') . "\n";
+        }
+        echo '</pre>';
+        $opsRows = db()->query('SELECT at, actor, action, key, detail FROM ops_log ORDER BY id DESC LIMIT 100')->fetchAll();
+        $opsTotal = (int)db()->query('SELECT COUNT(*) FROM ops_log')->fetchColumn();
+        echo '<h2 class="log-h">操作ログ OPS (' . $opsTotal . ')</h2><pre>';
+        foreach ($opsRows as $r) {
+            echo h($r['at'] . ' | ' . $r['actor'] . ' | ' . $r['action'] . ' | ' . $r['key'] . ' | ' . $r['detail']) . "\n";
+        }
+        echo '</pre>';
+        $accRows = db()->query('SELECT at, method, path, status, actor, ua FROM access_log ORDER BY id DESC LIMIT 100')->fetchAll();
+        $accTotal = (int)db()->query('SELECT COUNT(*) FROM access_log')->fetchColumn();
+        echo '<h2 class="log-h">アクセスログ ACCESS (' . $accTotal . ')</h2><pre>';
+        foreach ($accRows as $r) {
+            echo h($r['at'] . ' | ' . $r['method'] . ' | ' . $r['path'] . ' | ' . $r['status'] . ' | ' . $r['actor'] . ' | ' . $r['ua']) . "\n";
+        }
+        echo '</pre>';
+    } else {
+        echo '<details class="new-unit"><summary>+ NEW UNIT</summary>
 <form method="post" class="new-form"><input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="save">
 <label class="fld"><span>KEY</span><input type="text" name="key" required pattern="[A-Za-z0-9_.\-]{1,100}" placeholder="my_key"></label>
 <label class="fld"><span>CONTENT</span><textarea name="content" required rows="8"></textarea></label>
@@ -747,30 +785,11 @@ pre{white-space:pre-wrap;word-break:break-word;background:#080808;border:1px sol
         . admin_history_html($m['key'], $csrf) . '</div>';
     }
     echo '</section>';
+    }
 
-    $opsRows = db()->query('SELECT at, actor, action, key, detail FROM ops_log ORDER BY id DESC LIMIT 50')->fetchAll();
-    $opsTotal = (int)db()->query('SELECT COUNT(*) FROM ops_log')->fetchColumn();
-    echo '<details class="hist"><summary>操作ログ OPS (' . $opsTotal . ')</summary><pre>';
-    foreach ($opsRows as $r) {
-        echo h($r['at'] . ' | ' . $r['actor'] . ' | ' . $r['action'] . ' | ' . $r['key'] . ' | ' . $r['detail']) . "\n";
-    }
-    echo '</pre></details>';
-    $accRows = db()->query('SELECT at, method, path, status, actor, ua FROM access_log ORDER BY id DESC LIMIT 50')->fetchAll();
-    $accTotal = (int)db()->query('SELECT COUNT(*) FROM access_log')->fetchColumn();
-    echo '<details class="hist"><summary>アクセスログ ACCESS (' . $accTotal . ')</summary><pre>';
-    foreach ($accRows as $r) {
-        echo h($r['at'] . ' | ' . $r['method'] . ' | ' . $r['path'] . ' | ' . $r['status'] . ' | ' . $r['actor'] . ' | ' . $r['ua']) . "\n";
-    }
-    echo '</pre></details>';
-
-    echo '<h2 class="gone-h">DELETED UNITS // 削除済み</h2>';
-    $gone = db()->query('SELECT h.key AS k FROM memory_history h LEFT JOIN memories m ON m.key = h.key WHERE m.key IS NULL GROUP BY h.key ORDER BY h.key');
-    foreach ($gone->fetchAll() as $g) {
-        echo '<div class="mem gone"><div class="mem-head"><h3>' . h($g['k']) . '</h3></div>' . admin_history_html($g['k'], $csrf) . '</div>';
-    }
-    echo '</main>
-<script>document.getElementById("filter").addEventListener("input",function(){var q=this.value.toLowerCase();document.querySelectorAll("#list .mem").forEach(function(c){c.style.display=c.dataset.key.toLowerCase().indexOf(q)===-1?"none":""})});</script>
-</body></html>';
+    echo '</main>';
+    if ($page === '') echo '<script>var f=document.getElementById("filter");if(f)f.addEventListener("input",function(){var q=this.value.toLowerCase();document.querySelectorAll("#list .mem").forEach(function(c){c.style.display=c.dataset.key.toLowerCase().indexOf(q)===-1?"none":""})});</script>';
+    echo '</body></html>';
     exit;
 }
 
