@@ -445,11 +445,18 @@ function handle_mcp(): void {
             } catch (Throwable $e) {}
             $supported = ['2025-06-18', '2025-03-26', '2024-11-05'];
             $requested = $msg['params']['protocolVersion'] ?? '';
+            // 指示はメモリから動的に組み立て: instructions=全AI共通、instructions.<client名小文字>=個別
+            $inst = '複数のAIで共有する個人メモリ。確定事実はkv_*、その場限りのメモや好み・エピソードはadd_memory_log、曖昧検索はrecall_memories、近況俯瞰はget_recent_digests。上書き・削除は履歴に自動保存され、REST経由で復元可能。操作履歴はops_logに自動記録';
+            $g = get_memory('instructions');
+            if ($g !== null) $inst .= "\n\n## 全AI共通の指示\n" . $g['content'];
+            $ckey = 'instructions.' . preg_replace('/[^a-z0-9_.-]+/', '-', strtolower(trim($cname)));
+            $c = get_memory($ckey);
+            if ($c !== null) $inst .= "\n\n## " . $cname . " 専用の指示\n" . $c['content'];
             mcp_result($id, [
                 'protocolVersion' => in_array($requested, $supported, true) ? $requested : '2025-06-18',
                 'capabilities' => ['tools' => new stdClass],
                 'serverInfo' => ['name' => 'ai-memory', 'version' => '1.0.0'],
-                'instructions' => '複数のAIで共有する個人メモリ。確定事実はkv_*、その場限りのメモや好み・エピソードはadd_memory_log、曖昧検索はrecall_memories、近況俯瞰はget_recent_digests。上書き・削除は履歴に自動保存され、REST経由で復元可能。操作履歴はops_logに自動記録',
+                'instructions' => $inst,
             ]);
             break;
         case 'ping':
