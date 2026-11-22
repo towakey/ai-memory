@@ -634,6 +634,18 @@ function handle_admin(string $base): void {
                 $key = $_POST['key'] ?? '';
                 if (valid_key($key)) delete_memory($key);
                 break;
+            case 'save_client_instructions':
+                $c = $_POST['client'] ?? '';
+                $content = $_POST['content'] ?? '';
+                $norm = is_string($c) ? trim(preg_replace('/[^a-z0-9_.-]+/', '-', strtolower(trim($c))), '-.') : '';
+                if ($norm === '') {
+                    $_SESSION['flash'] = 'クライアント名が不正です';
+                } elseif (!valid_content($content)) {
+                    $_SESSION['flash'] = '内容が不正です（1MB以内の文字列）';
+                } else {
+                    save_memory('instructions.' . $norm, $content);
+                }
+                break;
             case 'restore':
                 $key = $_POST['key'] ?? '';
                 $id = $_POST['id'] ?? '';
@@ -647,7 +659,7 @@ function handle_admin(string $base): void {
                 session_destroy();
                 break;
         }
-        $ret = in_array($_POST['page'] ?? '', ['history', 'logs'], true) ? (string)$_POST['page'] : '';
+        $ret = in_array($_POST['page'] ?? '', ['instructions', 'history', 'logs'], true) ? (string)$_POST['page'] : '';
         admin_redirect($base, $ret);
     }
 
@@ -725,17 +737,56 @@ pre{white-space:pre-wrap;word-break:break-word;background:#080808;border:1px sol
         exit;
     }
 
-    $page = in_array($_GET['page'] ?? '', ['history', 'logs'], true) ? (string)$_GET['page'] : '';
-    $mems = db()->query('SELECT key, content, updated_at, updated_by FROM memories ORDER BY key')->fetchAll();
+    $page = in_array($_GET['page'] ?? '', ['instructions', 'history', 'logs'], true) ? (string)$_GET['page'] : '';
+    $mems = db()->query("SELECT key, content, updated_at, updated_by FROM memories WHERE key NOT LIKE 'instructions%' ORDER BY key")->fetchAll();
     echo '<header><div class="stripe"></div><div class="hdr-in"><div>
 <span class="brand-sm">SHARED MEMORY SYSTEM</span><h1 class="brand">AI MEMORY</h1></div>
 <div class="hdr-right"><span class="status">UNITS: ' . count($mems) . '</span>
 <form method="post"><input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="logout"><button type="submit" class="btn-ghost">LOGOUT</button></form></div></div>
-<nav class="tabs"><a href="' . h($base) . '/admin"' . ($page === '' ? ' class="on"' : '') . '>UNITS</a><a href="' . h($base) . '/admin?page=history"' . ($page === 'history' ? ' class="on"' : '') . '>HISTORY</a><a href="' . h($base) . '/admin?page=logs"' . ($page === 'logs' ? ' class="on"' : '') . '>LOGS</a></nav></header>';
+<nav class="tabs"><a href="' . h($base) . '/admin"' . ($page === '' ? ' class="on"' : '') . '>UNITS</a><a href="' . h($base) . '/admin?page=instructions"' . ($page === 'instructions' ? ' class="on"' : '') . '>INSTRUCTIONS</a><a href="' . h($base) . '/admin?page=history"' . ($page === 'history' ? ' class="on"' : '') . '>HISTORY</a><a href="' . h($base) . '/admin?page=logs"' . ($page === 'logs' ? ' class="on"' : '') . '>LOGS</a></nav></header>';
     echo '<main>';
     if ($flash !== null) echo '<div class="flash"><b>WARNING</b> ' . h($flash) . '</div>';
 
-    if ($page === 'history') {
+    if ($page === 'instructions') {
+        $instrCard = function (string $key, string $title, string $meta, ?array $m) use ($csrf): void {
+            $content = (string)($m['content'] ?? '');
+            $rows = min(20, max(6, substr_count($content, "\n") + 2));
+            $stamp = $m !== null ? 'updated: ' . h($m['updated_at'])
+                . (($m['updated_by'] ?? '') !== '' ? ' by ' . h($m['updated_by']) : '') : '未作成';
+            echo '<div class="mem"><div class="mem-head"><h3>' . h($title) . '</h3><span class="t">' . h($meta) . ' ' . $stamp . '</span></div>
+<form method="post" class="pad"><input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="save"><input type="hidden" name="key" value="' . h($key) . '"><input type="hidden" name="page" value="instructions">
+<label class="fld"><span>CONTENT</span><textarea name="content" rows="' . $rows . '">' . h($content) . '</textarea></label>
+<div class="btn-row"><button type="submit" class="btn-primary">保存 SAVE</button>'
+                . ($m !== null ? '<button type="submit" class="btn-danger" form="deli-' . h($key) . '">削除 DELETE</button>' : '') . '</div></form>'
+                . ($m !== null ? '<form method="post" id="deli-' . h($key) . '" onsubmit="return confirm(\'' . h($key) . ' を削除しますか？\')"><input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="delete"><input type="hidden" name="key" value="' . h($key) . '"><input type="hidden" name="page" value="instructions"></form>' : '')
+                . '</div>';
+        };
+        echo '<h2 class="log-h">GLOBAL // 全AI共通の指示（key: instructions）</h2>';
+        $instrCard('instructions', 'instructions', '全クライアントに送信', get_memory('instructions'));
+
+        echo '<h2 class="log-h">PER CLIENT // AIごとの指示（key: instructions.&lt;name&gt;）</h2>';
+        $norm = function (string $s): string { return trim(preg_replace('/[^a-z0-9_.-]+/', '-', strtolower(trim($s))), '-.'); };
+        $cards = [];
+        foreach (db()->query("SELECT key, content, updated_at, updated_by FROM memories WHERE key LIKE 'instructions.%' ORDER BY key")->fetchAll() as $e) {
+            $n = substr($e['key'], 13);
+            $cards[$n] = ['title' => $e['key'], 'mem' => $e, 'meta' => ''];
+        }
+        foreach (db()->query('SELECT client_name, MAX(created_at) last FROM mcp_sessions GROUP BY client_name ORDER BY client_name')->fetchAll() as $c) {
+            $n = $norm((string)$c['client_name']);
+            if ($n === '') continue;
+            if (!isset($cards[$n])) $cards[$n] = ['title' => (string)$c['client_name'], 'mem' => get_memory('instructions.' . $n), 'meta' => ''];
+            $cards[$n]['meta'] .= ' 接続記録: ' . $c['client_name'] . ' (last ' . $c['last'] . ')';
+        }
+        ksort($cards);
+        if ($cards === []) echo '<p class="t">まだ接続記録・個別指示がありません。下のフォームで作成できます。</p>';
+        foreach ($cards as $n => $c) $instrCard('instructions.' . $n, $c['title'], 'key: instructions.' . $n . $c['meta'], $c['mem']);
+
+        echo '<details class="new-unit"><summary>+ CLIENT 追加（まだ接続していないAI用）</summary>
+<form method="post" class="new-form"><input type="hidden" name="csrf" value="' . h($csrf) . '"><input type="hidden" name="action" value="save_client_instructions"><input type="hidden" name="page" value="instructions">
+<label class="fld"><span>CLIENT NAME</span><input type="text" name="client" required placeholder="例: chatgpt → instructions.chatgpt"></label>
+<label class="fld"><span>CONTENT</span><textarea name="content" required rows="6"></textarea></label>
+<button type="submit" class="btn-primary">CREATE</button></form></details>';
+    } elseif ($page === 'history') {
         echo '<h2 class="gone-h">DELETED UNITS // 削除済み</h2>';
         $gone = db()->query('SELECT h.key AS k FROM memory_history h LEFT JOIN memories m ON m.key = h.key WHERE m.key IS NULL GROUP BY h.key ORDER BY h.key');
         foreach ($gone->fetchAll() as $g) {
